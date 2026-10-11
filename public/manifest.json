@@ -1,0 +1,57 @@
+{
+  "name": "مكتبتي — نظام إدارة المكتبة ونقاط البيع",
+  "short_name": "مكتبتي",
+  "description": "نظام سحابي وهجين متكامل لإدارة المكتبات، المخزون، نقاط البيع والطباعة يعمل بكفاءة مع وبدون إنترنت",
+  "start_url": "/",
+  "id": "/",
+  "display": "standalone",
+  "background_color": "#F4F6F9",
+  "theme_color": "#92400E",
+  "dir": "rtl",
+  "lang": "ar",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "نقطة البيع (POS)",
+      "short_name": "فاتورة بيع",
+      "description": "فتح شاشة الكاشير والمبيعات السريعة",
+      "url": "/?page=saleInvoice",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "المخزون",
+      "short_name": "المخازن",
+      "description": "فحص كميات وأسعار الأصناف",
+      "url": "/?page=inventory",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "الخزينة وجرد اليومية",
+      "short_name": "الخزينة",
+      "description": "جرد النقدية وتقفيل الوردية",
+      "url": "/?page=dayClose",
+      "icons": [{ "src": "/icon.svg", "sizes": "any" }]
+    }
+  ],
+  "categories": ["business", "finance", "productivity", "utilities"]
+}

@@ -1,0 +1,491 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================
+    // ENTERPRISE ACCESS CONTROL HELPERS
+    // =========================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function getUserProfile(uid) {
+      return get(/databases/$(database)/documents/userProfiles/$(uid)).data;
+    }
+
+    function hasUserProfile() {
+      return isSignedIn() && exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid));
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isStaff() {
+      return hasUserProfile() &&
+        (!('isActive' in getUserProfile(request.auth.uid)) || getUserProfile(request.auth.uid).isActive != false);
+    }
+
+    function isAdmin() {
+      return isStaff() &&
+        ('role' in getUserProfile(request.auth.uid)) &&
+        getUserProfile(request.auth.uid).role == 'admin';
+    }
+
+    function staffHasPerm(permKey) {
+      return ('permissions' in getUserProfile(request.auth.uid)) &&
+        (permKey in getUserProfile(request.auth.uid).permissions) &&
+        getUserProfile(request.auth.uid).permissions[permKey] == true;
+    }
+
+    function hasPerm(permKey) {
+      return isAdmin() || (
+        isStaff() && staffHasPerm(permKey)
+      );
+    }
+
+    function isValidBalance(bal) {
+      return bal is map &&
+        bal.keys().hasOnly(['invoiced', 'paid', 'updatedAt']) &&
+        bal.invoiced is number &&
+        bal.paid is number &&
+        (bal.paid >= 0 || (isAdmin() && bal.paid == bal.invoiced)) &&
+        (!('updatedAt' in bal) || bal.updatedAt is string);
+    }
+
+    // =========================================================
+    // 1. USER PROFILES & ROLES
+    // =========================================================
+    match /userProfiles/{userId} {
+      // User can read their own profile during login/bootstrap. Active staff can read other profiles for roster/operator switching.
+      allow read: if isOwner(userId) || isStaff();
+      // Admin only can create employee profiles (no public self-admin escalation, and cannot create admin profiles)
+      allow create: if isAdmin() && request.resource.data.role != 'admin';
+      // Admin can update employee fields (prohibiting role escalation to or from admin); users can update their own lastLoginAt timestamp
+      allow update: if (
+        isAdmin() &&
+        request.resource.data.role != 'admin' &&
+        resource.data.role != 'admin'
+      ) || (
+        isOwner(userId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastLoginAt'])
+      );
+      // Only admin can delete employee profiles
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 2. AUDIT LOGS (IMMUTABLE, STRICT APPEND-ONLY)
+    // =========================================================
+    match /auditLogs/{logId} {
+      // Read allowed for admins or staff with reports permissions
+      allow read: if isAdmin() || hasPerm('reportsView');
+      // Create strictly validated against authenticated active staff actor and valid schema
+      allow create: if isStaff() &&
+        request.resource.data.id == logId &&
+        request.resource.data.actorUid == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.action is string &&
+        request.resource.data.entity is string &&
+        request.resource.data.details is map &&
+        request.resource.data.date is string &&
+        request.resource.data.createdAt is string &&
+        request.resource.data.actorName is string &&
+        (!('email' in request.auth.token) || request.resource.data.actorEmail == request.auth.token.email) &&
+        request.resource.data.keys().hasOnly(['id', 'action', 'entity', 'details', 'actorUid', 'createdBy', 'actorEmail', 'actorName', 'date', 'createdAt', 'severity', 'prevHash', 'sessionId', 'localSequence', 'hash']) &&
+        !exists(/databases/$(database)/documents/auditLogs/$(logId));
+      // STRICT ENTERPRISE RULE: Audit logs can NEVER be altered or erased by any user
+      allow update, delete: if false;
+    }
+
+    // =========================================================
+    // 3. OPERATION KEYS (IDEMPOTENCY PROTECTION)
+    // =========================================================
+    match /operationKeys/{keyId} {
+      allow read: if isStaff();
+      // Operation key can only be written once by active staff to guarantee idempotency and prevent replay attacks
+      allow create: if isStaff() &&
+        request.resource.data.id == keyId &&
+        request.resource.data.actorUid == request.auth.uid &&
+        !exists(/databases/$(database)/documents/operationKeys/$(keyId));
+      // STRICT ENTERPRISE RULE: Operation keys are immutable
+      allow update, delete: if false;
+    }
+
+    // =========================================================
+    // 4. SALES INVOICES (POS)
+    // =========================================================
+    match /invoices/{invoiceId} {
+      allow read: if isStaff();
+      // Creation strictly validated against authorized roles and legitimate payload
+      allow create: if isStaff() &&
+        (isAdmin() || hasPerm('posSales')) &&
+        request.resource.data.id == invoiceId &&
+        request.resource.data.actorUid == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.total is number &&
+        request.resource.data.total >= 0 &&
+        request.resource.data.paidAmount is number &&
+        request.resource.data.paidAmount >= 0 &&
+        request.resource.data.paidAmount <= request.resource.data.total &&
+        request.resource.data.items is list &&
+        request.resource.data.items.size() > 0 &&
+        request.resource.data.date is string &&
+        request.resource.data.operationId is string &&
+        !exists(/databases/$(database)/documents/invoices/$(invoiceId));
+      // Historical editing requires privileged role and preserves immutable identifiers
+      allow update: if isStaff() &&
+        (isAdmin() || hasPerm('editHistoricalSales')) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.createdBy == resource.data.createdBy &&
+        request.resource.data.operationId == resource.data.operationId;
+      allow delete: if isStaff() && (isAdmin() || hasPerm('deleteInvoices'));
+    }
+
+    // =========================================================
+    // 5. SALES RETURNS
+    // =========================================================
+    match /salesReturns/{returnId} {
+      allow read: if isStaff();
+      allow create: if hasPerm('salesReturns') || hasPerm('posSales');
+      allow update: if isAdmin() || hasPerm('salesReturns');
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 6. PRODUCTS INVENTORY
+    // =========================================================
+    match /products/{productId} {
+      allow read: if isStaff();
+      // Products creation by authorized inventory managers
+      allow create: if hasPerm('inventoryManage');
+      // Update: Inventory managers can update all fields. POS and Sales Returns can ONLY update qty and operation trackers. Purchases can update qty, costPrice, sellPrice, and operation trackers.
+      allow update: if (isAdmin() || hasPerm('inventoryManage')) ||
+        ((hasPerm('posSales') || hasPerm('salesReturns')) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['qty', 'lastOperationId', 'lastOperationType', 'lastOperationActorUid'])) ||
+        (hasPerm('purchasesManage') &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['qty', 'costPrice', 'sellPrice', 'lastOperationId', 'lastOperationType', 'lastOperationActorUid', 'lastOperationTime']));
+      allow delete: if hasPerm('inventoryManage') || isAdmin();
+    }
+
+    // =========================================================
+    // 7. STOCK MOVEMENTS (IMMUTABLE INVENTORY JOURNAL)
+    // =========================================================
+    match /stockMovements/{movementId} {
+      allow read: if isStaff();
+      // Creation strictly validated against authorized roles per movement type and legitimate payload
+      allow create: if isStaff() &&
+        request.resource.data.id == movementId &&
+        request.resource.data.productId is string &&
+        request.resource.data.delta is number &&
+        request.resource.data.actorUid == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.date is string &&
+        request.resource.data.createdAt is string &&
+        (!('referenceId' in request.resource.data) || request.resource.data.referenceId is string) &&
+        (
+          isAdmin() ||
+          (request.resource.data.type in ['sale', 'return', 'exchange_in', 'exchange_out'] && (hasPerm('posSales') || hasPerm('salesReturns'))) ||
+          (request.resource.data.type in ['purchase', 'purchase_return', 'purchaseReturn'] && hasPerm('purchasesManage')) ||
+          (request.resource.data.type == 'adjustment' && hasPerm('inventoryManage'))
+        );
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // =========================================================
+    // 8. CUSTOMERS & CUSTOMER ACCOUNTS
+    // =========================================================
+    match /customers/{customerId} {
+      allow read: if isStaff();
+      // Customer creation: full profile for customersManage/admin; POS cashier can auto-register at checkout without arbitrary discount rates
+      allow create: if isStaff() &&
+        request.resource.data.id == customerId &&
+        request.resource.data.name is string &&
+        (!('balance' in request.resource.data) || isValidBalance(request.resource.data.balance)) &&
+        (!('lastTransactionDate' in request.resource.data) || (request.resource.data.lastTransactionDate is string && request.resource.data.lastTransactionDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))) &&
+        (
+          isAdmin() || hasPerm('customersManage') ||
+          (
+            hasPerm('posSales') &&
+            request.resource.data.keys().hasOnly(['id', 'name', 'phone', 'address', 'createdAt', 'balance', 'loyaltyPoints', 'lastTransactionDate'])
+          )
+        );
+      // Field-Level Authorization:
+      // - Admins and customersManage can update full profile
+      // - POS cashiers can only update sales transactional fields (balance, loyalty points, contact info)
+      // - Sales returns and treasury/maintenance can only update balance ledger
+      allow update: if isStaff() &&
+        (!('balance' in request.resource.data) || isValidBalance(request.resource.data.balance)) &&
+        (!('lastTransactionDate' in request.resource.data) || (request.resource.data.lastTransactionDate is string && request.resource.data.lastTransactionDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))) &&
+        (
+          isAdmin() || staffHasPerm('customersManage') ||
+          (
+            staffHasPerm('posSales') &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'loyaltyPoints', 'lastTransactionDate', 'name', 'phone', 'address'])
+          ) ||
+          (
+            (staffHasPerm('salesReturns') || staffHasPerm('treasuryManage') || staffHasPerm('maintenance')) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance'])
+          )
+        );
+      allow delete: if isStaff() && (isAdmin() || hasPerm('customersManage'));
+    }
+
+    match /customerPayments/{paymentId} {
+      allow read: if isStaff();
+      allow create: if (hasPerm('customersManage') || hasPerm('posSales') || hasPerm('treasuryManage')) &&
+        request.resource.data.id == paymentId &&
+        request.resource.data.actorUid == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.customerId is string &&
+        request.resource.data.amount is number &&
+        request.resource.data.amount > 0 &&
+        request.resource.data.operationId is string &&
+        request.resource.data.originalEventDate is string &&
+        request.resource.data.statementDate is string &&
+        request.resource.data.postingDate is string &&
+        request.resource.data.effectiveCashDate is string &&
+        request.resource.data.createdAt is string &&
+        !exists(/databases/$(database)/documents/customerPayments/$(paymentId));
+      allow update, delete: if false;
+    }
+
+    // =========================================================
+    // 9. SUPPLIERS & PROCUREMENT
+    // =========================================================
+    match /suppliers/{supplierId} {
+      allow read: if isStaff();
+      // Creation restricted to suppliers managers and admins
+      allow create: if isStaff() &&
+        (isAdmin() || hasPerm('suppliersManage')) &&
+        request.resource.data.id == supplierId &&
+        request.resource.data.name is string &&
+        (!('balance' in request.resource.data) || isValidBalance(request.resource.data.balance));
+      // Field-Level Authorization:
+      // - Suppliers managers and admins can update all profile fields
+      // - Procurement, treasury, and maintenance can ONLY update balance ledger
+      allow update: if isStaff() &&
+        (!('balance' in request.resource.data) || isValidBalance(request.resource.data.balance)) &&
+        (
+          isAdmin() || staffHasPerm('suppliersManage') ||
+          (
+            (staffHasPerm('purchasesManage') || staffHasPerm('treasuryManage') || staffHasPerm('maintenance')) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance'])
+          )
+        );
+      allow delete: if isStaff() && (isAdmin() || hasPerm('suppliersManage'));
+    }
+
+    match /supplierPayments/{paymentId} {
+      allow read: if isStaff();
+      allow create: if (hasPerm('suppliersManage') || hasPerm('purchasesManage') || hasPerm('treasuryManage')) &&
+        request.resource.data.id == paymentId &&
+        request.resource.data.actorUid == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.supplierId is string &&
+        request.resource.data.amount is number &&
+        request.resource.data.amount > 0 &&
+        request.resource.data.operationId is string &&
+        request.resource.data.originalEventDate is string &&
+        request.resource.data.statementDate is string &&
+        request.resource.data.postingDate is string &&
+        request.resource.data.effectiveCashDate is string &&
+        request.resource.data.createdAt is string &&
+        !exists(/databases/$(database)/documents/supplierPayments/$(paymentId));
+      allow update, delete: if false;
+    }
+
+    match /purchases/{purchaseId} {
+      allow read: if isStaff();
+      // Creation strictly validated against authorized roles and legitimate payload
+      allow create: if isStaff() &&
+        (isAdmin() || hasPerm('purchasesManage')) &&
+        request.resource.data.id == purchaseId &&
+        request.resource.data.actorUid == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.total is number &&
+        request.resource.data.total >= 0 &&
+        request.resource.data.paidAmount is number &&
+        request.resource.data.paidAmount >= 0 &&
+        request.resource.data.items is list &&
+        request.resource.data.items.size() > 0 &&
+        request.resource.data.date is string &&
+        request.resource.data.operationId is string &&
+        !exists(/databases/$(database)/documents/purchases/$(purchaseId));
+      // STRICT ENTERPRISE RULE: Purchases are immutable ledgers once created.
+      // Historical modifications only by admin with preserved audit trails.
+      allow update: if isStaff() && isAdmin() &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.createdBy == resource.data.createdBy &&
+        request.resource.data.operationId == resource.data.operationId;
+      allow delete: if isStaff() && isAdmin();
+    }
+
+    match /purchaseReturns/{returnId} {
+      allow read: if isStaff();
+      allow create: if hasPerm('purchasesManage') &&
+        request.resource.data.id == returnId &&
+        request.resource.data.purchaseId is string &&
+        request.resource.data.totalRefund is number &&
+        request.resource.data.totalRefund >= 0 &&
+        request.resource.data.refundMethod in ['cash', 'credit'] &&
+        request.resource.data.items is list &&
+        request.resource.data.items.size() > 0 &&
+        request.resource.data.originalEventDate is string &&
+        request.resource.data.postingDate is string &&
+        request.resource.data.statementDate is string &&
+        request.resource.data.operationId is string &&
+        request.resource.data.createdAt is string &&
+        !exists(/databases/$(database)/documents/purchaseReturns/$(returnId));
+      allow update, delete: if false;
+    }
+
+    // =========================================================
+    // 10. EXPENSES & ACCOUNTING
+    // =========================================================
+    match /expenses/{expenseId} {
+      allow read: if isStaff();
+      allow create, update: if hasPerm('expensesManage');
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 11. TREASURY & FINANCIAL JOURNAL
+    // =========================================================
+    match /treasuryAdjustments/{adjId} {
+      allow read: if hasPerm('treasuryManage');
+      allow create: if hasPerm('treasuryManage');
+      allow update, delete: if isAdmin();
+    }
+
+    match /cashMovements/{moveId} {
+      allow read: if isAdmin() || hasPerm('treasuryManage');
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 12. DAILY CLOSINGS
+    // =========================================================
+    match /dailyClosings/{closingId} {
+      allow read: if isStaff();
+      allow create, update: if hasPerm('dayClose');
+      allow delete: if isAdmin();
+    }
+
+    match /dayCloses/{closeId} {
+      allow read: if isStaff();
+      allow create, update: if hasPerm('dayClose');
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 13. PRINTING TARIFFS
+    // =========================================================
+    match /printingTariffs/{tariffId} {
+      allow read: if isStaff();
+      allow create, update, delete: if hasPerm('printingTariffs');
+    }
+
+    // =========================================================
+    // 14. SYSTEM METADATA & SEQUENCES
+    // =========================================================
+    match /meta/{metaDoc} {
+      allow read: if isStaff();
+      allow create: if metaDoc == 'counters' ? (
+        isAdmin() || hasPerm('maintenance') || (
+          (hasPerm('posSales') || hasPerm('salesReturns') || hasPerm('purchasesManage')) &&
+          request.resource.data.keys().hasOnly(['invoice', 'salesReturn', 'purchase', 'purchaseReturn', 'payment', 'updatedAt']) &&
+          (!('invoice' in request.resource.data) || (request.resource.data.invoice is int && request.resource.data.invoice >= 0)) &&
+          (!('salesReturn' in request.resource.data) || (request.resource.data.salesReturn is int && request.resource.data.salesReturn >= 0)) &&
+          (!('purchase' in request.resource.data) || (request.resource.data.purchase is int && request.resource.data.purchase >= 0)) &&
+          (!('purchaseReturn' in request.resource.data) || (request.resource.data.purchaseReturn is int && request.resource.data.purchaseReturn >= 0)) &&
+          (!('payment' in request.resource.data) || (request.resource.data.payment is int && request.resource.data.payment >= 0))
+        )
+      ) : (isAdmin() || hasPerm('maintenance'));
+
+      allow update: if metaDoc == 'counters' ? (
+        isAdmin() || hasPerm('maintenance') || (
+          (hasPerm('posSales') || hasPerm('salesReturns') || hasPerm('purchasesManage')) &&
+          request.resource.data.keys().hasOnly(['invoice', 'salesReturn', 'purchase', 'purchaseReturn', 'payment', 'updatedAt']) &&
+          (!('invoice' in request.resource.data) || (request.resource.data.invoice is int && request.resource.data.invoice >= resource.data.get('invoice', 0))) &&
+          (!('salesReturn' in request.resource.data) || (request.resource.data.salesReturn is int && request.resource.data.salesReturn >= resource.data.get('salesReturn', 0))) &&
+          (!('purchase' in request.resource.data) || (request.resource.data.purchase is int && request.resource.data.purchase >= resource.data.get('purchase', 0))) &&
+          (!('purchaseReturn' in request.resource.data) || (request.resource.data.purchaseReturn is int && request.resource.data.purchaseReturn >= resource.data.get('purchaseReturn', 0))) &&
+          (!('payment' in request.resource.data) || (request.resource.data.payment is int && request.resource.data.payment >= resource.data.get('payment', 0)))
+        )
+      ) : (isAdmin() || hasPerm('maintenance'));
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 15. APPLICATION SETTINGS & BUSINESS CALENDAR
+    // =========================================================
+
+    // 15.1 Shop Branding & Invoice Preferences (Explicit path)
+    match /appSettings/shop {
+      allow read: if isStaff();
+      allow create, update: if isAdmin() || hasPerm('maintenance');
+      allow delete: if false;
+    }
+
+    // 15.2 Business Calendar Current Document (Explicit path)
+    match /appSettings/businessCalendar {
+      allow read: if isStaff();
+      allow delete: if false;
+
+      // Initial creation: strictly version 1, bound atomically to versions/1 with full content snapshot parity
+      allow create: if (isAdmin() || hasPerm('maintenance')) &&
+        request.resource.data.version == 1 &&
+        request.resource.data.effectiveFrom is string &&
+        request.resource.data.weeklyHolidays is list &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/1).data.version == 1 &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/1).data.effectiveFrom == request.resource.data.effectiveFrom &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/1).data.weeklyHolidays == request.resource.data.weeklyHolidays &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/1).data.get('officialHolidays', []) == request.resource.data.get('officialHolidays', []) &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/1).data.get('nonWorkingDates', []) == request.resource.data.get('nonWorkingDates', []);
+
+      // Sequential update: strictly nextVersion == prevVersion + 1, bound atomically to corresponding version record with full content snapshot parity
+      allow update: if (isAdmin() || hasPerm('maintenance')) &&
+        request.resource.data.version == resource.data.version + 1 &&
+        request.resource.data.effectiveFrom is string &&
+        request.resource.data.weeklyHolidays is list &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/$(string(request.resource.data.version))).data.version == request.resource.data.version &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/$(string(request.resource.data.version))).data.effectiveFrom == request.resource.data.effectiveFrom &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/$(string(request.resource.data.version))).data.weeklyHolidays == request.resource.data.weeklyHolidays &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/$(string(request.resource.data.version))).data.get('officialHolidays', []) == request.resource.data.get('officialHolidays', []) &&
+        getAfter(/databases/$(database)/documents/appSettings/businessCalendar/versions/$(string(request.resource.data.version))).data.get('nonWorkingDates', []) == request.resource.data.get('nonWorkingDates', []);
+
+      // 15.3 Business Calendar Immutable Historical Versions (Explicit subcollection path)
+      match /versions/{versionId} {
+        allow read: if isStaff();
+
+        // Creation must be atomic with current calendar mutation, matching versionId in path with full content snapshot parity
+        allow create: if (isAdmin() || hasPerm('maintenance')) &&
+          !exists(/databases/$(database)/documents/appSettings/businessCalendar/versions/$(versionId)) &&
+          request.resource.data.version == int(versionId) &&
+          request.resource.data.effectiveFrom is string &&
+          request.resource.data.weeklyHolidays is list &&
+          getAfter(/databases/$(database)/documents/appSettings/businessCalendar).data.version == request.resource.data.version &&
+          getAfter(/databases/$(database)/documents/appSettings/businessCalendar).data.effectiveFrom == request.resource.data.effectiveFrom &&
+          getAfter(/databases/$(database)/documents/appSettings/businessCalendar).data.weeklyHolidays == request.resource.data.weeklyHolidays &&
+          getAfter(/databases/$(database)/documents/appSettings/businessCalendar).data.get('officialHolidays', []) == request.resource.data.get('officialHolidays', []) &&
+          getAfter(/databases/$(database)/documents/appSettings/businessCalendar).data.get('nonWorkingDates', []) == request.resource.data.get('nonWorkingDates', []);
+
+        // Permanent immutability: updates and deletes are strictly prohibited on historical versions
+        allow update, delete: if false;
+      }
+    }
+
+    // =========================================================
+    // 16. DEFAULT DENY ALL OTHER COLLECTIONS
+    // =========================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+  }
+}
