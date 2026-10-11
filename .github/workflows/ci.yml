@@ -1,0 +1,26 @@
+   name: CI
+   on:
+     push:
+       branches: [ main, master ]
+     workflow_dispatch:
+   jobs:
+     validate:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - uses: actions/setup-node@v4
+           with:
+             node-version: 20
+         - uses: actions/setup-java@v4
+           with:
+             distribution: temurin
+             java-version: '21'
+         - run: npm install --legacy-peer-deps
+         - run: npx tsc --noEmit
+           if: always()
+         - run: npm test
+           if: always()
+         - run: npm run test:rules
+           if: always()
+         - run: npm run build
+           if: always()
