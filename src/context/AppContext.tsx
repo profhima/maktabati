@@ -1,0 +1,789 @@
+import React, { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
+import {
+  DBState,
+  PageId,
+  InvoiceItem,
+  PurchaseItem,
+  SalesReturnItem,
+  Invoice,
+  UserProfile,
+  UserPermissionSet,
+  Product,
+  Customer
+} from '../types';
+import {
+  fsdb,
+  fsauth,
+  COLLECTIONS,
+  defaultDB,
+  SYNC_WINDOW_DAYS,
+  recordAudit,
+  FieldValue
+} from '../lib/firebase';
+import { OfflineSyncManager, QueuedOfflineOperation } from '../lib/offlineSync';
+import {
+  hasPermission,
+  canAccessPage,
+  DEFAULT_ADMIN_PERMISSIONS,
+  getLocalUserProfiles,
+  saveLocalUserProfiles
+} from '../lib/permissions';
+import { verifyPin, hashPin } from '../lib/pinSecurity';
+import type firebase from 'firebase/compat/app';
+import { uid, todayStr, productFullName, beepSound } from '../lib/utils';
+import { validateCartStock, getBundleCalculatedCost, getBundleAvailableQty } from '../lib/bundles';
+
+export interface PrintModalData {
+  title?: string;
+  bodyHtml: string;
+  phone?: string;
+  filename?: string;
+  waMessage?: string;
+}
+
+interface AppContextType {
+  db: DBState;
+  setDb: React.Dispatch<React.SetStateAction<DBState>>;
+  currentPage: PageId;
+  goTo: (page: PageId) => void;
+  currentUser: firebase.User | null;
+  currentProfile: UserProfile | null;
+  activeOperator: UserProfile | null;
+  switchActiveOperator: (operatorId: string | null, pin?: string) => Promise<boolean> | boolean;
+  isAdmin: boolean;
+  hasPerm: (key: keyof UserPermissionSet | string) => boolean;
+  canAccess: (page: PageId) => boolean;
+  toastMessage: string | null;
+  toast: (msg: string) => void;
+  connStatus: {
+    online: boolean;
+    fromCache: boolean;
+    pendingWrites: boolean;
+    draftsCount: number;
+    offlinePendingCount: number;
+  };
+  // Modals & Popups
+  offlineModalOpen: boolean;
+  openOfflineModal: () => void;
+  closeOfflineModal: () => void;
+  pwaInstallPrompt: any;
+  triggerPwaInstall: () => void;
+  isPwaInstalled: boolean;
+  globalSearchOpen: boolean;
+  openGlobalSearch: () => void;
+  closeGlobalSearch: () => void;
+  scanModalOpen: boolean;
+  scanCallback: ((code: string) => void) | null;
+  openScanModal: (callback?: (code: string) => void) => void;
+  closeScanModal: () => void;
+  quickAddOpen: boolean;
+  quickAddContext: { prefix: 'inv' | 'pur'; typedName: string; qty: number } | null;
+  openQuickAdd: (prefix: 'inv' | 'pur', typedName?: string, qty?: number) => void;
+  closeQuickAdd: () => void;
+  printModalData: PrintModalData | null;
+  showPrintModal: (data: PrintModalData) => void;
+  closePrintModal: () => void;
+  operatorSwitchModalOpen: boolean;
+  openOperatorSwitchModal: () => void;
+  closeOperatorSwitchModal: () => void;
+  egyptianCatalogModalOpen: boolean;
+  openEgyptianCatalogModal: () => void;
+  closeEgyptianCatalogModal: () => void;
+  shadowTestOpen: boolean;
+  openShadowTest: () => void;
+  closeShadowTest: () => void;
+  selectedInvoiceForModal: Invoice | null;
+  openInvoiceModal: (invoice: Invoice) => void;
+  closeInvoiceModal: () => void;
+  reorderInvoiceToCart: (invoice: Invoice) => void;
+
+  // Sale POS Cart State
+  saleCartItems: InvoiceItem[];
+  setSaleCartItems: React.Dispatch<React.SetStateAction<InvoiceItem[]>>;
+  saleCategoryDiscounts: Record<string, { type: 'percent' | 'amount'; value: number }>;
+  setSaleCategoryDiscounts: React.Dispatch<React.SetStateAction<Record<string, { type: 'percent' | 'amount'; value: number }>>>;
+  addSaleItemByProduct: (productId: string, qty?: number) => boolean;
+  processInvoiceBarcode: (code: string, source?: 'scanner' | 'camera') => boolean;
+  clearSaleCart: () => void;
+
+  // Purchase Cart State
+  purchaseCartItems: PurchaseItem[];
+  setPurchaseCartItems: React.Dispatch<React.SetStateAction<PurchaseItem[]>>;
+
+  // Sales Return State
+  returnInvoice: Invoice | null;
+  setReturnInvoice: React.Dispatch<React.SetStateAction<Invoice | null>>;
+  returnSelections: Record<string, number>;
+  setReturnSelections: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+  exchangeItems: SalesReturnItem[];
+  setExchangeItems: React.Dispatch<React.SetStateAction<SalesReturnItem[]>>;
+  returnMode: 'cash' | 'exchange';
+  setReturnMode: (mode: 'cash' | 'exchange') => void;
+  clearReturnState: () => void;
+
+  // Helper sync flags
+  firstSyncDone: boolean;
+  reconcileBalances: () => Promise<void>;
+}
+
+const AppContext = createContext<AppContextType | undefined>(undefined);
+
+const OFFLINE_DRAFT_KEY = 'maktabati_stage11_drafts_v1';
+export function readOfflineDrafts(): Record<string, any> {
+  try {
+    return JSON.parse(localStorage.getItem(OFFLINE_DRAFT_KEY) || '{}') || {};
+  } catch (_e) {
+    return {};
+  }
+}
+export function writeOfflineDrafts(x: any) {
+  try {
+    localStorage.setItem(OFFLINE_DRAFT_KEY, JSON.stringify(x));
+  } catch (_e) {}
+}
+
+export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const [db, setDb] = useState<DBState>(() => {
+    const base = defaultDB();
+    const localProfiles = getLocalUserProfiles();
+    if (localProfiles.length > 0) {
+      base.userProfiles = localProfiles;
+    }
+    try {
+      const savedClosings = localStorage.getItem('maktabati_local_daily_closings');
+      if (savedClosings) {
+        const parsed = JSON.parse(savedClosings);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          base.dailyClosings = parsed;
+          (base as any).dayCloses = parsed;
+        }
+      }
+    } catch {}
+    return base;
+  });
+  const [currentPage, setCurrentPage] = useState<PageId>('saleInvoice');
+  const [currentUser, setCurrentUser] = useState<firebase.User | null>(null);
+  const [firstSyncDone, setFirstSyncDone] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [offlineModalOpen, setOfflineModalOpen] = useState(false);
+  const [pwaInstallPrompt, setPwaInstallPrompt] = useState<any>(null);
+  const [isPwaInstalled, setIsPwaInstalled] = useState(false);
+
+  const openOfflineModal = () => setOfflineModalOpen(true);
+  const closeOfflineModal = () => setOfflineModalOpen(false);
+
+  const [connStatus, setConnStatus] = useState({
+    online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    fromCache: false,
+    pendingWrites: false,
+    draftsCount: Object.keys(readOfflineDrafts()).length,
+    offlinePendingCount: OfflineSyncManager.getQueue().filter(q => q.status !== 'synced').length
+  });
+
+  // Listen to PWA install prompt
+  useEffect(() => {
+    const handleBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setPwaInstallPrompt(e);
+    };
+
+    const handleAppInstalled = () => {
+      setIsPwaInstalled(true);
+      setPwaInstallPrompt(null);
+      toast('🎉 تم تثبيت نظام مكتبتي على جهازك بنجاح!');
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    if (window.matchMedia('(display-mode: standalone)').matches) {
+      setIsPwaInstalled(true);
+    }
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
+
+  const triggerPwaInstall = async () => {
+    if (!pwaInstallPrompt) {
+      toast('التطبيق مثبت بالفعل أو أن متصفحك لا يدعم التثبيت المباشر');
+      return;
+    }
+    pwaInstallPrompt.prompt();
+    const { outcome } = await pwaInstallPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setPwaInstallPrompt(null);
+    }
+  };
+
+  // Subscribe to offline queue changes
+  useEffect(() => {
+    const unsub = OfflineSyncManager.subscribe(queue => {
+      const pendingCount = queue.filter(q => q.status !== 'synced').length;
+      setConnStatus(prev => ({
+        ...prev,
+        offlinePendingCount: pendingCount
+      }));
+    });
+    return () => unsub();
+  }, []);
+
+  // Modal states
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [scanModalOpen, setScanModalOpen] = useState(false);
+  const [scanCallback, setScanCallback] = useState<((code: string) => void) | null>(null);
+  const [quickAddOpen, setQuickAddOpen] = useState(false);
+  const [quickAddContext, setQuickAddContext] = useState<{ prefix: 'inv' | 'pur'; typedName: string; qty: number } | null>(null);
+  const [printModalData, setPrintModalData] = useState<PrintModalData | null>(null);
+  const [shadowTestOpen, setShadowTestOpen] = useState(false);
+  const [selectedInvoiceForModal, setSelectedInvoiceForModal] = useState<Invoice | null>(null);
+
+  // Operator Switch Modal State
+  const [operatorSwitchModalOpen, setOperatorSwitchModalOpen] = useState(false);
+  const [egyptianCatalogModalOpen, setEgyptianCatalogModalOpen] = useState(false);
+  const [activeOperatorId, setActiveOperatorId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('maktabati_active_operator_id') || null;
+    } catch {
+      return null;
+    }
+  });
+
+  const openOperatorSwitchModal = () => setOperatorSwitchModalOpen(true);
+  const closeOperatorSwitchModal = () => setOperatorSwitchModalOpen(false);
+  const openEgyptianCatalogModal = () => setEgyptianCatalogModalOpen(true);
+  const closeEgyptianCatalogModal = () => setEgyptianCatalogModalOpen(false);
+
+  const openInvoiceModal = (invoice: Invoice) => {
+    setSelectedInvoiceForModal(invoice);
+  };
+
+  const closeInvoiceModal = () => {
+    setSelectedInvoiceForModal(null);
+  };
+
+  const reorderInvoiceToCart = (invoice: Invoice) => {
+    if (!invoice.items || invoice.items.length === 0) {
+      toast('لا توجد أصناف في هذه الفاتورة');
+      return;
+    }
+    setSaleCartItems(invoice.items.map(it => ({ ...it })));
+    closeInvoiceModal();
+    goTo('saleInvoice');
+    toast(`🛒 تم تحميل أصناف الفاتورة #${invoice.number} في سلة البيع بنجاح`);
+  };
+
+  // POS State
+  const [saleCartItems, setSaleCartItems] = useState<InvoiceItem[]>([]);
+  const [saleCategoryDiscounts, setSaleCategoryDiscounts] = useState<Record<string, { type: 'percent' | 'amount'; value: number }>>({});
+  const [purchaseCartItems, setPurchaseCartItems] = useState<PurchaseItem[]>([]);
+
+  // Return State
+  const [returnInvoice, setReturnInvoice] = useState<Invoice | null>(null);
+  const [returnSelections, setReturnSelections] = useState<Record<string, number>>({});
+  const [exchangeItems, setExchangeItems] = useState<SalesReturnItem[]>([]);
+  const [returnMode, setReturnMode] = useState<'cash' | 'exchange'>('cash');
+
+  // Barcode and POS Quick Action Ref
+  const lastBarcodeRef = useRef<{ code: string; time: number }>({ code: '', time: 0 });
+
+  const toast = (msg: string) => {
+    setToastMessage(msg);
+  };
+
+  useEffect(() => {
+    if (!toastMessage) return;
+    const timer = setTimeout(() => setToastMessage(null), 2500);
+    return () => clearTimeout(timer);
+  }, [toastMessage]);
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = fsauth.onAuthStateChanged((user) => {
+      setCurrentUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Online / Offline listeners
+  useEffect(() => {
+    const handleOnline = async () => {
+      setConnStatus(prev => ({
+        ...prev,
+        online: true,
+        draftsCount: Object.keys(readOfflineDrafts()).length
+      }));
+      toast('🟢 عاد الاتصال بالإنترنت — جاري فحص ومزامنة العمليات المعلقة...');
+
+      // Background auto-sync of queued offline invoices
+      try {
+        const res = await OfflineSyncManager.syncAllPending();
+        if (res.synced > 0) {
+          toast(`🚀 تمت مزامنة ${res.synced} فاتورة/عملية تلقائياً مع السحابة!`);
+        }
+      } catch (err) {
+        console.warn('Auto-sync background attempt note:', err);
+      }
+    };
+    const handleOffline = () => {
+      setConnStatus(prev => ({
+        ...prev,
+        online: false,
+        draftsCount: Object.keys(readOfflineDrafts()).length
+      }));
+      toast('⚪ انقطع الإنترنت — وضع الأوفلاين نشط (يمكنك مواصلة البيع وحفظ الفواتير محلياً)');
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Sync with Firestore
+  useEffect(() => {
+    if (!currentUser) return;
+
+    let syncReadyCount = 0;
+    const syncCutoff = new Date(Date.now() - SYNC_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
+    const unsubs: Array<() => void> = [];
+
+    const initSubscriptions = async () => {
+      // 1. Subscribe to User Profiles collection directly
+      try {
+        const userProfilesUnsub = fsdb.collection('userProfiles').onSnapshot(
+          { includeMetadataChanges: true },
+          (snap) => {
+            const cloudProfiles: UserProfile[] = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+            if (cloudProfiles.length > 0) {
+              saveLocalUserProfiles(cloudProfiles);
+              setDb(prev => ({
+                ...prev,
+                userProfiles: cloudProfiles
+              }));
+            }
+          },
+          (err) => {
+            console.warn('User profiles collection sync notice:', err.message);
+            // Fallback to own doc subscription if collection query is restricted
+            const ownDocUnsub = fsdb.collection('userProfiles').doc(currentUser.uid).onSnapshot(
+              (snap) => {
+                if (snap.exists) {
+                  const p: UserProfile = { id: snap.id, ...(snap.data() as any) };
+                  setDb(prev => {
+                    const others = (prev.userProfiles || []).filter(x => x.uid !== p.uid);
+                    return { ...prev, userProfiles: [p, ...others] };
+                  });
+                }
+              },
+              () => {}
+            );
+            unsubs.push(ownDocUnsub);
+          }
+        );
+        unsubs.push(userProfilesUnsub);
+      } catch (err) {
+        console.warn('Profile listener error:', err);
+      }
+
+      // 2. Subscribe to standard business collections (excluding append-only / write-only logging)
+      const subs = COLLECTIONS.filter(name => name !== 'operationKeys' && name !== 'auditLogs').map(name => {
+        if (name === 'stockMovements') {
+          return { name, ref: fsdb.collection(name).where('date', '>=', syncCutoff) };
+        }
+        return { name, ref: fsdb.collection(name) };
+      });
+
+      subs.forEach(({ name, ref }) => {
+        const unsub = (ref as any).onSnapshot(
+          { includeMetadataChanges: true },
+          (snap: firebase.firestore.QuerySnapshot) => {
+            const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+            
+            setDb(prev => ({
+              ...prev,
+              [name]: items
+            }));
+
+            setConnStatus(prev => ({
+              ...prev,
+              fromCache: !!snap.metadata.fromCache,
+              pendingWrites: !!snap.metadata.hasPendingWrites,
+              draftsCount: Object.keys(readOfflineDrafts()).length
+            }));
+
+            if (!firstSyncDone) {
+              syncReadyCount++;
+              if (syncReadyCount >= subs.length) {
+                setFirstSyncDone(true);
+              }
+            }
+          },
+          (err: any) => {
+            console.warn(`Sync note for collection ${name}:`, err.message);
+          }
+        );
+        unsubs.push(unsub);
+      });
+    };
+
+    initSubscriptions();
+
+    // Fallback timer so UI is never blocked if network or snapshot is slow
+    const fallbackTimer = setTimeout(() => {
+      setFirstSyncDone(true);
+    }, 1500);
+
+    return () => {
+      clearTimeout(fallbackTimer);
+      unsubs.forEach(unsub => unsub());
+    };
+  }, [currentUser]);
+
+  const currentProfile = (db.userProfiles || []).find(x => x.uid === currentUser?.uid) || null;
+  const activeOperator = activeOperatorId
+    ? (db.userProfiles || []).find(x => x.uid === activeOperatorId || x.id === activeOperatorId) || null
+    : null;
+
+  const effectiveProfile = activeOperator || currentProfile;
+  const isAdmin = Boolean(effectiveProfile && effectiveProfile.role === 'admin');
+
+  const hasPerm = (key: keyof UserPermissionSet | string): boolean => {
+    return hasPermission(effectiveProfile, key as keyof UserPermissionSet);
+  };
+
+  const canAccess = (page: PageId): boolean => {
+    return canAccessPage(page, effectiveProfile);
+  };
+
+  const switchActiveOperator = async (targetId: string | null, pin?: string): Promise<boolean> => {
+    if (!targetId) {
+      // Switching to main account / Admin
+      setActiveOperatorId(null);
+      try {
+        localStorage.removeItem('maktabati_active_operator_id');
+      } catch {}
+      toast('👑 تم التبديل إلى حساب الإدارة الرئيسي');
+      return true;
+    }
+
+    const targetUser = (db.userProfiles || []).find(x => x.uid === targetId || x.id === targetId);
+    if (!targetUser) {
+      toast('المستخدم غير موجود بالنظام');
+      return false;
+    }
+
+    // Verify PIN if profile is protected by pinHash or legacy pinCode
+    if (targetUser.pinHash || targetUser.pinCode) {
+      if (!pin) {
+        toast('❌ رمز الـ PIN مطلوب للتبديل إلى هذا المستخدم');
+        return false;
+      }
+      const isValid = await verifyPin(pin, targetUser);
+      if (!isValid) {
+        toast('❌ رمز الـ PIN غير صحيح');
+        return false;
+      }
+
+      // Seamless background migration: convert legacy plaintext pinCode to PBKDF2-HMAC-SHA256 pinHash
+      if (targetUser.pinCode && !targetUser.pinHash) {
+        const generatedHash = await hashPin(pin);
+        targetUser.pinHash = generatedHash;
+        delete targetUser.pinCode;
+
+        // Persist migrated profile
+        const updatedList = (db.userProfiles || []).map(p =>
+          (p.uid === targetUser.uid || p.id === targetUser.id) ? targetUser : p
+        );
+        saveLocalUserProfiles(updatedList);
+        if (targetUser.uid) {
+          fsdb.collection('userProfiles').doc(targetUser.uid).set(
+            { pinHash: generatedHash, pinCode: FieldValue ? FieldValue.delete() : null },
+            { merge: true }
+          ).catch(() => {});
+        }
+      }
+    }
+
+    const opId = targetUser.uid || targetUser.id || targetId;
+    setActiveOperatorId(opId);
+    try {
+      localStorage.setItem('maktabati_active_operator_id', opId);
+    } catch {}
+
+    // Update last login timestamp in background
+    if (currentUser?.uid) {
+      fsdb.collection('userProfiles').doc(currentUser.uid).set(
+        { lastLoginAt: new Date().toISOString() },
+        { merge: true }
+      ).catch(() => {});
+    }
+
+    toast(`👤 تم تسجيل الدخول: ${targetUser.name} (${targetUser.role})`);
+    return true;
+  };
+
+  const goTo = (page: PageId) => {
+    setCurrentPage(page);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const addSaleItemByProduct = (productId: string, qtyToAdd = 1): boolean => {
+    const p = db.products.find(x => x.id === productId);
+    if (!p) {
+      toast('الصنف غير موجود بالمخزون');
+      return false;
+    }
+    const qty = Math.max(1, qtyToAdd);
+
+    // Validate entire cart stock against physical inventory (including bundle components)
+    const validation = validateCartStock(saleCartItems, db.products, { productId, qty });
+    if (!validation.valid) {
+      toast(validation.error || 'المخزون غير كافٍ');
+      return false;
+    }
+
+    const itemCost = p.isBundle ? getBundleCalculatedCost(p, db.products) : (p.costPrice || 0);
+
+    setSaleCartItems(prev => {
+      const idx = prev.findIndex(it => it.productId === productId);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], qty: next[idx].qty + qty, cost: itemCost };
+        return next;
+      } else {
+        return [
+          ...prev,
+          {
+            productId: p.id,
+            name: productFullName(p),
+            qty,
+            price: p.sellPrice,
+            originalPrice: p.sellPrice,
+            cost: itemCost,
+            term: p.term || ''
+          }
+        ];
+      }
+    });
+    toast(`✅ ${p.name} × ${qty}`);
+    return true;
+  };
+
+  const processInvoiceBarcode = (code: string, source: 'scanner' | 'camera' = 'scanner'): boolean => {
+    const bc = String(code || '').trim();
+    if (!bc) return false;
+
+    const now = Date.now();
+    if (bc === lastBarcodeRef.current.code && now - lastBarcodeRef.current.time < 250) {
+      return false;
+    }
+    lastBarcodeRef.current = { code: bc, time: now };
+
+    const p = db.products.find(x => String(x.barcode || '').trim() === bc);
+    if (p) {
+      beepSound();
+      return addSaleItemByProduct(p.id, 1);
+    }
+    toast(`لم يتم العثور على صنف بالباركود: ${bc}`);
+    return false;
+  };
+
+  const clearSaleCart = () => {
+    setSaleCartItems([]);
+    setSaleCategoryDiscounts({});
+  };
+
+  const clearReturnState = () => {
+    setReturnInvoice(null);
+    setReturnSelections({});
+    setExchangeItems([]);
+    setReturnMode('cash');
+  };
+
+  const openScanModal = (callback?: (code: string) => void) => {
+    setScanCallback(() => callback || null);
+    setScanModalOpen(true);
+  };
+
+  const closeScanModal = () => {
+    setScanModalOpen(false);
+    setScanCallback(null);
+  };
+
+  const openQuickAdd = (prefix: 'inv' | 'pur', typedName = '', qty = 1) => {
+    setQuickAddContext({ prefix, typedName, qty });
+    setQuickAddOpen(true);
+  };
+
+  const closeQuickAdd = () => {
+    setQuickAddOpen(false);
+    setQuickAddContext(null);
+  };
+
+  const showPrintModal = (data: PrintModalData) => {
+    setPrintModalData(data);
+  };
+
+  const closePrintModal = () => {
+    setPrintModalData(null);
+  };
+
+  const openGlobalSearch = () => setGlobalSearchOpen(true);
+  const closeGlobalSearch = () => setGlobalSearchOpen(false);
+  const openShadowTest = () => setShadowTestOpen(true);
+  const closeShadowTest = () => setShadowTestOpen(false);
+
+  const reconcileBalances = async () => {
+    if (!isAdmin) {
+      toast('إعادة حساب الأرصدة متاحة لمدير النظام فقط');
+      return;
+    }
+    try {
+      let updatedCustomers = 0;
+      let updatedSuppliers = 0;
+
+      const customerBatches: firebase.firestore.WriteBatch[] = [];
+      let curBatch = fsdb.batch();
+      let curCount = 0;
+
+      for (const c of (db.customers || [])) {
+        const active = (db.invoices || []).filter(i => i.customerId === c.id && i.status !== 'refunded');
+        const invoiced = active.reduce((s, i) => s + (Number(i.total) || 0), 0);
+        const paidAtSale = active.reduce((s, i) => s + (Number(i.paidAmount ?? i.total) || 0), 0);
+        const returns = (db.salesReturns || []).filter(r => r.customerId === c.id);
+        const returnCredit = returns.reduce((s, r) => s + (Number(r.creditReduction) || 0), 0);
+        const extraPayments = (db.customerPayments || []).filter(x => x.customerId === c.id).reduce((s, x) => s + (Number(x.amount) || 0), 0);
+
+        const b = { invoiced: invoiced - returnCredit, paid: paidAtSale + extraPayments };
+        curBatch.update(fsdb.collection('customers').doc(c.id), {
+          balance: { invoiced: b.invoiced, paid: b.paid, updatedAt: new Date().toISOString() }
+        });
+        curCount++;
+        updatedCustomers++;
+        if (curCount >= 400) {
+          customerBatches.push(curBatch);
+          curBatch = fsdb.batch();
+          curCount = 0;
+        }
+      }
+      if (curCount > 0) customerBatches.push(curBatch);
+      for (const b of customerBatches) await b.commit();
+
+      const supplierBatches: firebase.firestore.WriteBatch[] = [];
+      curBatch = fsdb.batch();
+      curCount = 0;
+
+      for (const s of (db.suppliers || [])) {
+        const purchased = (db.purchases || []).filter(p => p.supplierId === s.id).reduce((sum, p) => sum + (Number(p.total) || 0), 0);
+        const paidAtPurchase = (db.purchases || []).filter(p => p.supplierId === s.id).reduce((sum, p) => sum + (Number(p.paidAmount ?? p.total) || 0), 0);
+        const extraPayments = (db.supplierPayments || []).filter(x => x.supplierId === s.id).reduce((sum, x) => sum + (Number(x.amount) || 0), 0);
+
+        const b = { purchased, paid: paidAtPurchase + extraPayments };
+        curBatch.update(fsdb.collection('suppliers').doc(s.id), {
+          balance: { invoiced: b.purchased, paid: b.paid, updatedAt: new Date().toISOString() }
+        });
+        curCount++;
+        updatedSuppliers++;
+        if (curCount >= 400) {
+          supplierBatches.push(curBatch);
+          curBatch = fsdb.batch();
+          curCount = 0;
+        }
+      }
+      if (curCount > 0) supplierBatches.push(curBatch);
+      for (const b of supplierBatches) await b.commit();
+
+      toast(`✅ تمت تسوية ${updatedCustomers} عميل و ${updatedSuppliers} مورد بنجاح.`);
+    } catch (e: any) {
+      toast(`خطأ أثناء تسوية الأرصدة: ${e.message}`);
+    }
+  };
+
+  return (
+    <AppContext.Provider
+      value={{
+        db,
+        setDb,
+        currentPage,
+        goTo,
+        currentUser,
+        currentProfile,
+        activeOperator,
+        switchActiveOperator,
+        isAdmin,
+        hasPerm,
+        canAccess,
+        toastMessage,
+        toast,
+        connStatus,
+        offlineModalOpen,
+        openOfflineModal,
+        closeOfflineModal,
+        pwaInstallPrompt,
+        triggerPwaInstall,
+        isPwaInstalled,
+        globalSearchOpen,
+        openGlobalSearch,
+        closeGlobalSearch,
+        scanModalOpen,
+        scanCallback,
+        openScanModal,
+        closeScanModal,
+        quickAddOpen,
+        quickAddContext,
+        openQuickAdd,
+        closeQuickAdd,
+        printModalData,
+        showPrintModal,
+        closePrintModal,
+        operatorSwitchModalOpen,
+        openOperatorSwitchModal,
+        closeOperatorSwitchModal,
+        egyptianCatalogModalOpen,
+        openEgyptianCatalogModal,
+        closeEgyptianCatalogModal,
+        shadowTestOpen,
+        openShadowTest,
+        closeShadowTest,
+        selectedInvoiceForModal,
+        openInvoiceModal,
+        closeInvoiceModal,
+        reorderInvoiceToCart,
+        saleCartItems,
+        setSaleCartItems,
+        saleCategoryDiscounts,
+        setSaleCategoryDiscounts,
+        addSaleItemByProduct,
+        processInvoiceBarcode,
+        clearSaleCart,
+        purchaseCartItems,
+        setPurchaseCartItems,
+        returnInvoice,
+        setReturnInvoice,
+        returnSelections,
+        setReturnSelections,
+        exchangeItems,
+        setExchangeItems,
+        returnMode,
+        setReturnMode,
+        clearReturnState,
+        firstSyncDone,
+        reconcileBalances
+      }}
+    >
+      {children}
+    </AppContext.Provider>
+  );
+};
+
+export const useApp = () => {
+  const context = useContext(AppContext);
+  if (!context) {
+    throw new Error('useApp must be used within an AppProvider');
+  }
+  return context;
+};
