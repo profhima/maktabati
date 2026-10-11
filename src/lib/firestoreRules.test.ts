@@ -6361,7 +6361,7 @@ describe.skipIf(!isEmulatorRunning)('Firestore Security Rules Baseline Suite (T0
 
       const saleTx = cashierDb.runTransaction(async (tx) => {
         tx.set(cashierDb.doc(`operationKeys/${opKeyInv}`), {
-          key: opKeyInv,
+          id: opKeyInv,
           usedAt: '2026-10-05T12:00:00Z',
           actorUid: cashierUid
         });
@@ -6411,7 +6411,7 @@ describe.skipIf(!isEmulatorRunning)('Firestore Security Rules Baseline Suite (T0
 
       const payTx = cashierDb.runTransaction(async (tx) => {
         tx.set(cashierDb.doc(`operationKeys/${opKeyPay}`), {
-          key: opKeyPay,
+          id: opKeyPay,
           usedAt: '2026-10-05T12:05:00Z',
           actorUid: cashierUid
         });
