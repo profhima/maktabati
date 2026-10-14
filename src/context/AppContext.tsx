@@ -141,6 +141,74 @@ export function writeOfflineDrafts(x: any) {
   } catch (_e) {}
 }
 
+export interface ProfileSnapshotHandlerOptions {
+  onVerified: (profile: UserProfile) => void;
+  onNotFound: () => void;
+  onError: (errorMessage: string) => void;
+  onLoading?: () => void;
+  timeoutMs?: number;
+}
+
+/**
+ * Handles Firestore userProfile snapshot with cache-vs-server awareness:
+ * 1. If snap.exists === false && snap.metadata.fromCache === true:
+ *    Do NOT set not_found. Stay in loading waiting for server.
+ * 2. If no confirmed server response arrives within 8s (timeoutMs), switch to error.
+ * 3. Only set not_found when snap.exists === false && snap.metadata.fromCache === false.
+ * 4. Cleans up timers when server responds or on unsubscribe, preventing updates after cleanup.
+ */
+export function handleProfileDocumentSnapshot(
+  snap: {
+    exists: boolean | (() => boolean);
+    id?: string;
+    data?: () => any;
+    metadata?: { fromCache?: boolean; hasPendingWrites?: boolean };
+  },
+  currentTimer: any,
+  setTimer: (timer: any) => void,
+  callbacks: ProfileSnapshotHandlerOptions,
+  isCleanedUp: () => boolean
+): void {
+  if (isCleanedUp()) return;
+
+  const exists = typeof snap.exists === 'function' ? snap.exists() : Boolean(snap.exists);
+  const fromCache = Boolean(snap.metadata?.fromCache);
+  const timeoutMs = callbacks.timeoutMs ?? 8000;
+
+  if (exists) {
+    if (currentTimer) {
+      clearTimeout(currentTimer);
+      setTimer(null);
+    }
+    const rawData = typeof snap.data === 'function' ? snap.data() : (snap as any).data || {};
+    const profile: UserProfile = { id: snap.id || '', ...rawData };
+    callbacks.onVerified(profile);
+  } else if (fromCache) {
+    // 1. Missing in cache, awaiting server authoritative response: stay in loading
+    if (callbacks.onLoading) {
+      callbacks.onLoading();
+    }
+    // 2. Start 8-second timer waiting for server confirmation
+    if (!currentTimer) {
+      const timer = setTimeout(() => {
+        if (isCleanedUp()) return;
+        setTimer(null);
+        callbacks.onError(
+          'تعذر التحقق من الصلاحيات من الخادم السحابي بعد الانتظار (8 ثوانٍ). يُرجى التحقق من اتصال الإنترنت وإعادة المحاولة.'
+        );
+      }, timeoutMs);
+      setTimer(timer);
+    }
+  } else {
+    // 3. Confirmed server response: document explicitly does not exist
+    if (currentTimer) {
+      clearTimeout(currentTimer);
+      setTimer(null);
+    }
+    callbacks.onNotFound();
+  }
+}
+
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [db, setDb] = useState<DBState>(() => {
     const base = defaultDB();
@@ -379,6 +447,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const syncCutoff = new Date(Date.now() - SYNC_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
     const unsubs: Array<() => void> = [];
     let isCleanedUp = false;
+    let serverTimeoutTimer: any = null;
+
+    const clearServerTimer = () => {
+      if (serverTimeoutTimer) {
+        clearTimeout(serverTimeoutTimer);
+        serverTimeoutTimer = null;
+      }
+    };
 
     const initSubscriptions = async () => {
       // 1. Authoritative subscription to current user's individual profile document
@@ -387,23 +463,45 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const ownDocUnsub = ownDocRef.onSnapshot(
           { includeMetadataChanges: true },
           (snap: firebase.firestore.DocumentSnapshot) => {
-            if (isCleanedUp) return;
-            if (snap.exists) {
-              const p: UserProfile = { id: snap.id, ...(snap.data() as any) };
-              setDb(prev => {
-                const others = (prev.userProfiles || []).filter(x => x.uid !== p.uid && x.id !== p.id);
-                return { ...prev, userProfiles: [p, ...others] };
-              });
-              setProfileVerificationStatus('verified');
-              setProfileVerificationError(null);
-            } else {
-              // Confirmed reading succeeded, document explicitly does not exist in Firestore
-              setProfileVerificationStatus('not_found');
-              setProfileVerificationError(null);
-            }
+            handleProfileDocumentSnapshot(
+              snap,
+              serverTimeoutTimer,
+              (t) => {
+                serverTimeoutTimer = t;
+              },
+              {
+                onVerified: (p) => {
+                  if (isCleanedUp) return;
+                  setDb(prev => {
+                    const others = (prev.userProfiles || []).filter(x => x.uid !== p.uid && x.id !== p.id);
+                    return { ...prev, userProfiles: [p, ...others] };
+                  });
+                  setProfileVerificationStatus('verified');
+                  setProfileVerificationError(null);
+                },
+                onLoading: () => {
+                  if (isCleanedUp) return;
+                  setProfileVerificationStatus('loading');
+                  setProfileVerificationError(null);
+                },
+                onNotFound: () => {
+                  if (isCleanedUp) return;
+                  setProfileVerificationStatus('not_found');
+                  setProfileVerificationError(null);
+                },
+                onError: (errMsg) => {
+                  if (isCleanedUp) return;
+                  setProfileVerificationStatus('error');
+                  setProfileVerificationError(errMsg);
+                },
+                timeoutMs: 8000
+              },
+              () => isCleanedUp
+            );
           },
           (err: any) => {
             if (isCleanedUp) return;
+            clearServerTimer();
             console.warn('Profile doc sync error:', err.message);
             setProfileVerificationStatus('error');
             setProfileVerificationError(err.message || 'تعذر قراءة بيانات المستخدم من الخادم');
@@ -412,6 +510,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         unsubs.push(ownDocUnsub);
       } catch (err: any) {
         if (!isCleanedUp) {
+          clearServerTimer();
           setProfileVerificationStatus('error');
           setProfileVerificationError(err.message || 'فشل إعداد مستمع ملف المستخدم');
         }
@@ -431,6 +530,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
               }));
               const myProfile = cloudProfiles.find(x => x.uid === currentUser.uid);
               if (myProfile) {
+                clearServerTimer();
                 setProfileVerificationStatus('verified');
                 setProfileVerificationError(null);
               }
@@ -495,16 +595,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (isCleanedUp) return;
       setProfileVerificationStatus(prev => {
         if (prev === 'loading') {
-          setProfileVerificationError('انتهت مهلة انتظار الاتصال بقاعدة البيانات. يُرجى التحقق من اتصال الإنترنت وإعادة المحاولة.');
+          setProfileVerificationError('انتهت مهلة انتظار الاتصال بقاعدة البيانات (8 ثوانٍ). يُرجى التحقق من اتصال الإنترنت وإعادة المحاولة.');
           return 'error';
         }
         return prev;
       });
       setFirstSyncDone(true);
-    }, 5000);
+    }, 8000);
 
     return () => {
       isCleanedUp = true;
+      clearServerTimer();
       clearTimeout(fallbackTimer);
       unsubs.forEach(unsub => unsub());
     };
