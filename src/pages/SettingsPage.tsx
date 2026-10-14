@@ -47,7 +47,7 @@ import {
 } from 'lucide-react';
 
 export const SettingsPage: React.FC = () => {
-  const { toast, showPrintModal, isAdmin, activeOperator, currentProfile, db } = useApp();
+  const { toast, showPrintModal, isAdmin, currentUser, currentProfile, db } = useApp();
   const [settings, setSettings] = useState<ShopSettings>(() => getShopSettings());
   const [activeTab, setActiveTab] = useState<'branding' | 'thermal' | 'a4' | 'calendar'>('branding');
   const [previewMode, setPreviewMode] = useState<'thermal' | 'a4'>('thermal');
@@ -66,10 +66,10 @@ export const SettingsPage: React.FC = () => {
   const [calReason, setCalReason] = useState('');
   const [savingCalendar, setSavingCalendar] = useState(false);
 
-  const actorRole = activeOperator?.role || currentProfile?.role || (isAdmin ? 'admin' : 'cashier');
+  const actorRole = currentProfile?.role || (isAdmin ? 'admin' : 'cashier');
   const userActor: UserActorContext = {
-    uid: activeOperator?.uid || currentProfile?.uid || 'u_admin',
-    name: activeOperator?.name || currentProfile?.name || 'المدير المسؤول',
+    uid: currentProfile?.uid || currentUser?.uid || 'u_admin',
+    name: currentProfile?.name || currentUser?.displayName || 'المدير المسؤول',
     role: actorRole
   };
 

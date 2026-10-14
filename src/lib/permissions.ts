@@ -291,6 +291,43 @@ export const PERMISSION_DEFINITIONS: PermissionDefinition[] = [
   }
 ];
 
+/**
+ * Resolves the authenticated session profile and permissions strictly from the Firebase Auth UID.
+ * Complete lockdown against local operator switching or arbitrary client overrides.
+ */
+export function resolveEffectiveSession(
+  profiles: UserProfile[] | undefined | null,
+  currentUserUid?: string | null
+): {
+  currentProfile: UserProfile | null;
+  isAccountActive: boolean;
+  effectiveProfile: UserProfile | null;
+  isAdmin: boolean;
+} {
+  if (!currentUserUid) {
+    return {
+      currentProfile: null,
+      isAccountActive: false,
+      effectiveProfile: null,
+      isAdmin: false
+    };
+  }
+
+  const currentProfile = (profiles || []).find(x => x.uid === currentUserUid) || null;
+  const isAccountActive = Boolean(
+    currentProfile && currentProfile.isActive !== false && !(currentProfile as any).disabled
+  );
+  const effectiveProfile = isAccountActive ? currentProfile : null;
+  const isAdmin = Boolean(effectiveProfile && effectiveProfile.role === 'admin');
+
+  return {
+    currentProfile,
+    isAccountActive,
+    effectiveProfile,
+    isAdmin
+  };
+}
+
 export function hasPermission(
   profile: UserProfile | null | undefined,
   key: keyof UserPermissionSet | string
@@ -298,8 +335,8 @@ export function hasPermission(
   // STRICT FAIL-CLOSED: If no profile exists, DENY all access (especially sensitive financial costs/profits)
   if (!profile) return false;
 
-  // Inactive accounts cannot perform operations or view data
-  if (profile.isActive === false) return false;
+  // Inactive or disabled accounts cannot perform operations or view data
+  if (profile.isActive === false || (profile as any).disabled === true) return false;
 
   // Super Admin has universal access
   if (profile.role === 'admin') return true;
@@ -322,7 +359,7 @@ export function hasPermission(
 export function canAccessPage(page: PageId, profile: UserProfile | null | undefined): boolean {
   // STRICT FAIL-CLOSED: Unauthenticated / no-profile cannot access protected pages
   if (!profile) return false;
-  if (profile.isActive === false) return false;
+  if (profile.isActive === false || (profile as any).disabled === true) return false;
   if (profile.role === 'admin') return true;
 
   const perms = (profile.permissions || ROLE_PRESETS[profile.role]?.permissions || DEFAULT_CASHIER_PERMISSIONS) as UserPermissionSet;
@@ -373,53 +410,60 @@ export function canAccessPage(page: PageId, profile: UserProfile | null | undefi
 export const LOCAL_USERS_STORAGE_KEY = 'maktabati_local_user_profiles_v2';
 
 export function getLocalUserProfiles(): UserProfile[] {
-  try {
-    const raw = localStorage.getItem(LOCAL_USERS_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  // Operational reliance removed for security hardening
+  return [];
 }
 
-export function saveLocalUserProfiles(profiles: UserProfile[]) {
-  try {
-    localStorage.setItem(LOCAL_USERS_STORAGE_KEY, JSON.stringify(profiles));
-  } catch {}
+export function saveLocalUserProfiles(_profiles: UserProfile[]) {
+  // Operational saving stopped to prevent local plaintext/hash exposure in localStorage
 }
 
 import { verifyPin } from './pinSecurity';
 
 /**
  * Validates if the supplied PIN belongs to an active Admin or Manager (or authorized staff).
- * STRICT SECURITY: Zero plaintext comparison, SHA-256 salted verification.
+ * STRICT SECURITY: Zero plaintext comparison, salted PBKDF2/SHA-256 verification.
+ * Rejects if trusted user profiles are missing or empty; NEVER falls back to local storage.
  */
 export async function verifyAdminOrManagerPin(
   pinInput: string,
   userProfiles: UserProfile[] = []
-): Promise<{ valid: boolean; approver?: { name: string; role: string; uid: string } }> {
+): Promise<{ valid: boolean; approver?: { name: string; role: string; uid: string }; error?: string }> {
   const pin = (pinInput || '').trim();
-  if (!pin) return { valid: false };
+  if (!pin) return { valid: false, error: 'رمز المرور مطلوب' };
 
-  // Check registered Admin / Manager PINs exclusively
-  const list = userProfiles.length > 0 ? userProfiles : getLocalUserProfiles();
-  for (const u of list) {
-    if (
-      u.isActive !== false &&
-      (u.role === 'admin' || u.role === 'manager' || (u.permissions as any)?.allowDiscountOverride)
-    ) {
-      const isValid = await verifyPin(pin, u);
-      if (isValid) {
-        return {
-          valid: true,
-          approver: {
-            name: u.name,
-            role: u.role,
-            uid: u.uid || u.id || ''
-          }
-        };
-      }
+  // STRICT REQUIREMENT: Only verify against trusted in-memory profiles loaded from authoritative source.
+  // NEVER fall back to getLocalUserProfiles() or local storage. If no trusted profiles are available, reject safely.
+  if (!Array.isArray(userProfiles) || userProfiles.length === 0) {
+    return { valid: false, error: 'تعذر التحقق من الصلاحيات: قائمة الموظفين الموثوقة غير متوفرة حالياً' };
+  }
+
+  for (const u of userProfiles) {
+    // Account must be strictly active (both isActive !== false AND disabled !== true)
+    const isDeactivated = u.isActive === false || (u as any).disabled === true;
+    if (isDeactivated) {
+      continue;
+    }
+
+    // Must be an authorized manager, admin, or have allowDiscountOverride explicitly
+    const isAuthorized = u.role === 'admin' || u.role === 'manager' || !!(u.permissions as any)?.allowDiscountOverride;
+    if (!isAuthorized) {
+      continue;
+    }
+
+    const isValid = await verifyPin(pin, u);
+    if (isValid) {
+      return {
+        valid: true,
+        approver: {
+          name: u.name,
+          role: u.role,
+          uid: u.uid || u.id || ''
+        }
+      };
     }
   }
 
-  return { valid: false };
+  return { valid: false, error: 'رمز المرور غير صحيح أو غير مخول' };
 }
+

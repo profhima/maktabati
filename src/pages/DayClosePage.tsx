@@ -29,7 +29,7 @@ import {
 const CASH_DENOMINATIONS = [200, 100, 50, 20, 10, 5, 1];
 
 export const DayClosePage: React.FC = () => {
-  const { db, setDb, showPrintModal, activeOperator, currentProfile, toast } = useApp();
+  const { db, setDb, showPrintModal, currentUser, currentProfile, toast } = useApp();
 
   const [closeDate, setCloseDate] = useState(todayStr());
   const [actualCashInDrawer, setActualCashInDrawer] = useState<number | ''>('');
@@ -161,7 +161,7 @@ export const DayClosePage: React.FC = () => {
     // Deterministic closeId: exactly the closeDate
     const closeId = closeDate;
     const opKey = `op_close_${closeDate}`;
-    const cashierName = activeOperator?.name || currentProfile?.name || 'المدير المسؤول';
+    const cashierName = currentProfile?.name || currentUser?.displayName || 'المدير المسؤول';
 
     const recordData: DailyClosing = {
       id: closeId,

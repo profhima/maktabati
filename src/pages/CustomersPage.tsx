@@ -653,7 +653,7 @@ export const CustomersPage: React.FC = () => {
                     if (check.valid && check.approver) {
                       executeDebtReset(check.approver);
                     } else {
-                      toast('❌ رمز المرور غير صحيح');
+                      toast(check.error ? `❌ ${check.error}` : '❌ رمز المرور غير صحيح');
                     }
                   }
                 }}
@@ -682,7 +682,7 @@ export const CustomersPage: React.FC = () => {
                   if (check.valid && check.approver) {
                     executeDebtReset(check.approver);
                   } else {
-                    toast('❌ رمز المرور غير صحيح');
+                    toast(check.error ? `❌ ${check.error}` : '❌ رمز المرور غير صحيح');
                   }
                 }}
                 className="py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs transition-colors shadow-xs cursor-pointer"

@@ -64,7 +64,7 @@ export const Sidebar: React.FC<{ isOpen?: boolean; onClose?: () => void }> = ({
   isOpen = false,
   onClose
 }) => {
-  const { db, currentPage, goTo, canAccess, hasPerm, activeOperator, openOperatorSwitchModal } = useApp();
+  const { db, currentPage, goTo, canAccess, hasPerm, currentUser, currentProfile } = useApp();
 
   const lowStock = (db.products || []).filter(p => p.qty <= (p.minQty || 0));
   const todaySales = (db.invoices || [])
@@ -119,28 +119,27 @@ export const Sidebar: React.FC<{ isOpen?: boolean; onClose?: () => void }> = ({
           </div>
         </div>
 
-        {/* Active Operator Pill */}
+        {/* Authenticated User Session Card */}
         <div className="px-3 pt-3">
-          <button
-            onClick={openOperatorSwitchModal}
-            className="w-full bg-slate-800/90 hover:bg-slate-800 rounded-xl p-2.5 border border-slate-700 text-right flex items-center justify-between transition-colors cursor-pointer"
-            title="انقر لتبديل الموظف أو قفل الوردية بـ PIN"
+          <div
+            className="w-full bg-slate-800/90 rounded-xl p-2.5 border border-slate-700 text-right flex items-center justify-between"
+            title={`جلسة الحساب: ${currentProfile?.name || currentUser?.displayName || currentUser?.email || 'المستخدم'}`}
           >
             <div className="flex items-center gap-2 min-w-0">
               <span className="text-base">
-                {activeOperator ? ROLE_PRESETS[activeOperator.role]?.icon || '👤' : '👑'}
+                {currentProfile ? ROLE_PRESETS[currentProfile.role]?.icon || '👤' : '👑'}
               </span>
               <div className="min-w-0">
-                <span className="text-[10px] text-amber-400 font-bold block">المشغل الحالي:</span>
+                <span className="text-[10px] text-amber-400 font-bold block">المستخدم الحالي:</span>
                 <span className="text-xs text-white font-bold truncate block">
-                  {activeOperator ? activeOperator.name : 'المدير العام (Admin)'}
+                  {currentProfile ? currentProfile.name : (currentUser?.displayName || currentUser?.email || 'المدير العام')}
                 </span>
               </div>
             </div>
-            <span className="text-[10px] bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full font-bold border border-amber-500/30">
-              تبديل ⇄
+            <span className="text-[10px] bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full font-bold border border-slate-600">
+              {currentProfile ? (ROLE_PRESETS[currentProfile.role]?.label.split(' ')[0] || currentProfile.role) : 'إدارة'}
             </span>
-          </button>
+          </div>
         </div>
 
         {/* Real-time Low Stock Alerts Widget (if user has inventory or sales permission) */}

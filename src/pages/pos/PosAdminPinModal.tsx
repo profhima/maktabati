@@ -46,7 +46,7 @@ export const PosAdminPinModal: React.FC<PosAdminPinModalProps> = ({
         setPendingSaveAction(null);
       }
     } else {
-      toast('❌ رمز المرور غير صحيح');
+      toast(check.error ? `❌ ${check.error}` : '❌ رمز المرور غير صحيح');
     }
   };
 

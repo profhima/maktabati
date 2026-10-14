@@ -294,20 +294,8 @@ export async function verifyPin(
         profile.pinSalt = uniqueSalt;
         delete (profile as any).pinCode;
 
-        // Persist migrated hash to local storage if profile is cached
-        const localProfilesRaw = localStorage.getItem('maktabati_local_user_profiles_v2');
-        if (localProfilesRaw) {
-          const localProfiles = JSON.parse(localProfilesRaw);
-          if (Array.isArray(localProfiles)) {
-            const idx = localProfiles.findIndex((p: any) => p.uid === identifier || p.id === identifier);
-            if (idx >= 0) {
-              localProfiles[idx].pinHash = newPbkdf2Hash;
-              localProfiles[idx].pinSalt = uniqueSalt;
-              delete localProfiles[idx].pinCode;
-              localStorage.setItem('maktabati_local_user_profiles_v2', JSON.stringify(localProfiles));
-            }
-          }
-        }
+        // In-flight in-memory migration updates the active profile object.
+        // Writing to maktabati_local_user_profiles_v2 is permanently disabled for security.
         recordPinSecurityEvent('pin_migrated', identifier, { method: 'in_flight_pbkdf2' });
       } catch (_migErr) {
         // Migration failure shouldn't block the user

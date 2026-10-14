@@ -1265,6 +1265,13 @@ export class OfflineSyncManager {
     return { synced, failed, skippedOtherUser, errors };
   }
 
+  // Get pending operations in the queue that belong to another user or lack an ownerUid
+  static getPendingOtherUserOperations(currentUid?: string): QueuedOfflineOperation[] {
+    const queue = this.getQueue();
+    const uid = currentUid || fsauth.currentUser?.uid || '';
+    return queue.filter(q => q.status !== 'synced' && (!q.ownerUid || q.ownerUid !== uid));
+  }
+
   // Diagnostic helper to inspect storage quota
   static async getStorageEstimate(): Promise<{ usageMB: number; quotaMB: number; percent: number }> {
     try {

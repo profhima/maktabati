@@ -24,11 +24,9 @@ import { OfflineSyncManager, QueuedOfflineOperation } from '../lib/offlineSync';
 import {
   hasPermission,
   canAccessPage,
-  DEFAULT_ADMIN_PERMISSIONS,
-  getLocalUserProfiles,
-  saveLocalUserProfiles
+  resolveEffectiveSession,
+  DEFAULT_ADMIN_PERMISSIONS
 } from '../lib/permissions';
-import { verifyPin, hashPin } from '../lib/pinSecurity';
 import type firebase from 'firebase/compat/app';
 import { uid, todayStr, productFullName, beepSound } from '../lib/utils';
 import { validateCartStock, getBundleCalculatedCost, getBundleAvailableQty } from '../lib/bundles';
@@ -41,15 +39,19 @@ export interface PrintModalData {
   waMessage?: string;
 }
 
-interface AppContextType {
+export interface AppContextType {
   db: DBState;
   setDb: React.Dispatch<React.SetStateAction<DBState>>;
   currentPage: PageId;
   goTo: (page: PageId) => void;
   currentUser: firebase.User | null;
   currentProfile: UserProfile | null;
-  activeOperator: UserProfile | null;
-  switchActiveOperator: (operatorId: string | null, pin?: string) => Promise<boolean> | boolean;
+  effectiveProfile: UserProfile | null;
+  isAccountActive: boolean;
+  profileVerificationStatus: 'loading' | 'verified' | 'not_found' | 'error';
+  profileVerificationError: string | null;
+  retryProfileVerification: () => void;
+  otherUserPendingCount: number;
   isAdmin: boolean;
   hasPerm: (key: keyof UserPermissionSet | string) => boolean;
   canAccess: (page: PageId) => boolean;
@@ -83,9 +85,6 @@ interface AppContextType {
   printModalData: PrintModalData | null;
   showPrintModal: (data: PrintModalData) => void;
   closePrintModal: () => void;
-  operatorSwitchModalOpen: boolean;
-  openOperatorSwitchModal: () => void;
-  closeOperatorSwitchModal: () => void;
   egyptianCatalogModalOpen: boolean;
   openEgyptianCatalogModal: () => void;
   closeEgyptianCatalogModal: () => void;
@@ -126,7 +125,7 @@ interface AppContextType {
   reconcileBalances: () => Promise<void>;
 }
 
-const AppContext = createContext<AppContextType | undefined>(undefined);
+export const AppContext = createContext<AppContextType | undefined>(undefined);
 
 const OFFLINE_DRAFT_KEY = 'maktabati_stage11_drafts_v1';
 export function readOfflineDrafts(): Record<string, any> {
@@ -145,10 +144,7 @@ export function writeOfflineDrafts(x: any) {
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [db, setDb] = useState<DBState>(() => {
     const base = defaultDB();
-    const localProfiles = getLocalUserProfiles();
-    if (localProfiles.length > 0) {
-      base.userProfiles = localProfiles;
-    }
+    base.userProfiles = [];
     try {
       const savedClosings = localStorage.getItem('maktabati_local_daily_closings');
       if (savedClosings) {
@@ -164,6 +160,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [currentPage, setCurrentPage] = useState<PageId>('saleInvoice');
   const [currentUser, setCurrentUser] = useState<firebase.User | null>(null);
   const [firstSyncDone, setFirstSyncDone] = useState(false);
+  const [profileVerificationStatus, setProfileVerificationStatus] = useState<
+    'loading' | 'verified' | 'not_found' | 'error'
+  >('loading');
+  const [profileVerificationError, setProfileVerificationError] = useState<string | null>(null);
+  const [profileRetryCount, setProfileRetryCount] = useState(0);
+
+  const retryProfileVerification = () => {
+    setProfileVerificationStatus('loading');
+    setProfileVerificationError(null);
+    setProfileRetryCount(c => c + 1);
+  };
+
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [offlineModalOpen, setOfflineModalOpen] = useState(false);
   const [pwaInstallPrompt, setPwaInstallPrompt] = useState<any>(null);
@@ -240,21 +248,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [shadowTestOpen, setShadowTestOpen] = useState(false);
   const [selectedInvoiceForModal, setSelectedInvoiceForModal] = useState<Invoice | null>(null);
 
-  // Operator Switch Modal State
-  const [operatorSwitchModalOpen, setOperatorSwitchModalOpen] = useState(false);
   const [egyptianCatalogModalOpen, setEgyptianCatalogModalOpen] = useState(false);
-  const [activeOperatorId, setActiveOperatorId] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem('maktabati_active_operator_id') || null;
-    } catch {
-      return null;
-    }
-  });
-
-  const openOperatorSwitchModal = () => setOperatorSwitchModalOpen(true);
-  const closeOperatorSwitchModal = () => setOperatorSwitchModalOpen(false);
   const openEgyptianCatalogModal = () => setEgyptianCatalogModalOpen(true);
   const closeEgyptianCatalogModal = () => setEgyptianCatalogModalOpen(false);
+
+  // Clean up legacy operator session and cached profile keys safely from localStorage
+  useEffect(() => {
+    try {
+      localStorage.removeItem('maktabati_active_operator_id');
+      localStorage.removeItem('maktabati_local_user_profiles_v2');
+    } catch {}
+  }, []);
+
+  // Track pending offline operations belonging to other users (or unowned)
+  const [otherUserPendingCount, setOtherUserPendingCount] = useState<number>(() => {
+    return OfflineSyncManager.getPendingOtherUserOperations(fsauth.currentUser?.uid).length;
+  });
+
+  useEffect(() => {
+    const unsub = OfflineSyncManager.subscribe(() => {
+      setOtherUserPendingCount(
+        OfflineSyncManager.getPendingOtherUserOperations(currentUser?.uid).length
+      );
+    });
+    setOtherUserPendingCount(
+      OfflineSyncManager.getPendingOtherUserOperations(currentUser?.uid).length
+    );
+    return () => unsub();
+  }, [currentUser]);
 
   const openInvoiceModal = (invoice: Invoice) => {
     setSelectedInvoiceForModal(invoice);
@@ -345,51 +366,86 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Sync with Firestore
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser) {
+      setProfileVerificationStatus('loading');
+      setProfileVerificationError(null);
+      return;
+    }
+
+    setProfileVerificationStatus('loading');
+    setProfileVerificationError(null);
 
     let syncReadyCount = 0;
     const syncCutoff = new Date(Date.now() - SYNC_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
     const unsubs: Array<() => void> = [];
+    let isCleanedUp = false;
 
     const initSubscriptions = async () => {
-      // 1. Subscribe to User Profiles collection directly
+      // 1. Authoritative subscription to current user's individual profile document
+      try {
+        const ownDocRef = fsdb.collection('userProfiles').doc(currentUser.uid);
+        const ownDocUnsub = ownDocRef.onSnapshot(
+          { includeMetadataChanges: true },
+          (snap: firebase.firestore.DocumentSnapshot) => {
+            if (isCleanedUp) return;
+            if (snap.exists) {
+              const p: UserProfile = { id: snap.id, ...(snap.data() as any) };
+              setDb(prev => {
+                const others = (prev.userProfiles || []).filter(x => x.uid !== p.uid && x.id !== p.id);
+                return { ...prev, userProfiles: [p, ...others] };
+              });
+              setProfileVerificationStatus('verified');
+              setProfileVerificationError(null);
+            } else {
+              // Confirmed reading succeeded, document explicitly does not exist in Firestore
+              setProfileVerificationStatus('not_found');
+              setProfileVerificationError(null);
+            }
+          },
+          (err: any) => {
+            if (isCleanedUp) return;
+            console.warn('Profile doc sync error:', err.message);
+            setProfileVerificationStatus('error');
+            setProfileVerificationError(err.message || 'تعذر قراءة بيانات المستخدم من الخادم');
+          }
+        );
+        unsubs.push(ownDocUnsub);
+      } catch (err: any) {
+        if (!isCleanedUp) {
+          setProfileVerificationStatus('error');
+          setProfileVerificationError(err.message || 'فشل إعداد مستمع ملف المستخدم');
+        }
+      }
+
+      // 2. Collection listener for userProfiles roster (if authorized / accessible)
       try {
         const userProfilesUnsub = fsdb.collection('userProfiles').onSnapshot(
           { includeMetadataChanges: true },
-          (snap) => {
+          (snap: firebase.firestore.QuerySnapshot) => {
+            if (isCleanedUp) return;
             const cloudProfiles: UserProfile[] = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
             if (cloudProfiles.length > 0) {
-              saveLocalUserProfiles(cloudProfiles);
               setDb(prev => ({
                 ...prev,
                 userProfiles: cloudProfiles
               }));
+              const myProfile = cloudProfiles.find(x => x.uid === currentUser.uid);
+              if (myProfile) {
+                setProfileVerificationStatus('verified');
+                setProfileVerificationError(null);
+              }
             }
           },
-          (err) => {
-            console.warn('User profiles collection sync notice:', err.message);
-            // Fallback to own doc subscription if collection query is restricted
-            const ownDocUnsub = fsdb.collection('userProfiles').doc(currentUser.uid).onSnapshot(
-              (snap) => {
-                if (snap.exists) {
-                  const p: UserProfile = { id: snap.id, ...(snap.data() as any) };
-                  setDb(prev => {
-                    const others = (prev.userProfiles || []).filter(x => x.uid !== p.uid);
-                    return { ...prev, userProfiles: [p, ...others] };
-                  });
-                }
-              },
-              () => {}
-            );
-            unsubs.push(ownDocUnsub);
+          (err: any) => {
+            console.warn('User profiles collection sync note:', err.message);
           }
         );
         unsubs.push(userProfilesUnsub);
       } catch (err) {
-        console.warn('Profile listener error:', err);
+        console.warn('User profiles collection listener error:', err);
       }
 
-      // 2. Subscribe to standard business collections (excluding append-only / write-only logging)
+      // 3. Subscribe to standard business collections (excluding append-only / write-only logging)
       const subs = COLLECTIONS.filter(name => name !== 'operationKeys' && name !== 'auditLogs').map(name => {
         if (name === 'stockMovements') {
           return { name, ref: fsdb.collection(name).where('date', '>=', syncCutoff) };
@@ -401,8 +457,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const unsub = (ref as any).onSnapshot(
           { includeMetadataChanges: true },
           (snap: firebase.firestore.QuerySnapshot) => {
+            if (isCleanedUp) return;
             const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-            
+
             setDb(prev => ({
               ...prev,
               [name]: items
@@ -432,24 +489,31 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     initSubscriptions();
 
-    // Fallback timer so UI is never blocked if network or snapshot is slow
+    // Fallback timer so UI is never blocked indefinitely if offline/slow:
+    // CRITICAL: Does NOT assume not_found! If still loading, switches safely to 'error'.
     const fallbackTimer = setTimeout(() => {
+      if (isCleanedUp) return;
+      setProfileVerificationStatus(prev => {
+        if (prev === 'loading') {
+          setProfileVerificationError('انتهت مهلة انتظار الاتصال بقاعدة البيانات. يُرجى التحقق من اتصال الإنترنت وإعادة المحاولة.');
+          return 'error';
+        }
+        return prev;
+      });
       setFirstSyncDone(true);
-    }, 1500);
+    }, 5000);
 
     return () => {
+      isCleanedUp = true;
       clearTimeout(fallbackTimer);
       unsubs.forEach(unsub => unsub());
     };
-  }, [currentUser]);
+  }, [currentUser, profileRetryCount]);
 
-  const currentProfile = (db.userProfiles || []).find(x => x.uid === currentUser?.uid) || null;
-  const activeOperator = activeOperatorId
-    ? (db.userProfiles || []).find(x => x.uid === activeOperatorId || x.id === activeOperatorId) || null
-    : null;
-
-  const effectiveProfile = activeOperator || currentProfile;
-  const isAdmin = Boolean(effectiveProfile && effectiveProfile.role === 'admin');
+  const { currentProfile, isAccountActive, effectiveProfile, isAdmin } = resolveEffectiveSession(
+    profileVerificationStatus === 'verified' ? db.userProfiles : [],
+    currentUser?.uid
+  );
 
   const hasPerm = (key: keyof UserPermissionSet | string): boolean => {
     return hasPermission(effectiveProfile, key as keyof UserPermissionSet);
@@ -457,73 +521,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const canAccess = (page: PageId): boolean => {
     return canAccessPage(page, effectiveProfile);
-  };
-
-  const switchActiveOperator = async (targetId: string | null, pin?: string): Promise<boolean> => {
-    if (!targetId) {
-      // Switching to main account / Admin
-      setActiveOperatorId(null);
-      try {
-        localStorage.removeItem('maktabati_active_operator_id');
-      } catch {}
-      toast('👑 تم التبديل إلى حساب الإدارة الرئيسي');
-      return true;
-    }
-
-    const targetUser = (db.userProfiles || []).find(x => x.uid === targetId || x.id === targetId);
-    if (!targetUser) {
-      toast('المستخدم غير موجود بالنظام');
-      return false;
-    }
-
-    // Verify PIN if profile is protected by pinHash or legacy pinCode
-    if (targetUser.pinHash || targetUser.pinCode) {
-      if (!pin) {
-        toast('❌ رمز الـ PIN مطلوب للتبديل إلى هذا المستخدم');
-        return false;
-      }
-      const isValid = await verifyPin(pin, targetUser);
-      if (!isValid) {
-        toast('❌ رمز الـ PIN غير صحيح');
-        return false;
-      }
-
-      // Seamless background migration: convert legacy plaintext pinCode to PBKDF2-HMAC-SHA256 pinHash
-      if (targetUser.pinCode && !targetUser.pinHash) {
-        const generatedHash = await hashPin(pin);
-        targetUser.pinHash = generatedHash;
-        delete targetUser.pinCode;
-
-        // Persist migrated profile
-        const updatedList = (db.userProfiles || []).map(p =>
-          (p.uid === targetUser.uid || p.id === targetUser.id) ? targetUser : p
-        );
-        saveLocalUserProfiles(updatedList);
-        if (targetUser.uid) {
-          fsdb.collection('userProfiles').doc(targetUser.uid).set(
-            { pinHash: generatedHash, pinCode: FieldValue ? FieldValue.delete() : null },
-            { merge: true }
-          ).catch(() => {});
-        }
-      }
-    }
-
-    const opId = targetUser.uid || targetUser.id || targetId;
-    setActiveOperatorId(opId);
-    try {
-      localStorage.setItem('maktabati_active_operator_id', opId);
-    } catch {}
-
-    // Update last login timestamp in background
-    if (currentUser?.uid) {
-      fsdb.collection('userProfiles').doc(currentUser.uid).set(
-        { lastLoginAt: new Date().toISOString() },
-        { merge: true }
-      ).catch(() => {});
-    }
-
-    toast(`👤 تم تسجيل الدخول: ${targetUser.name} (${targetUser.role})`);
-    return true;
   };
 
   const goTo = (page: PageId) => {
@@ -712,8 +709,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         goTo,
         currentUser,
         currentProfile,
-        activeOperator,
-        switchActiveOperator,
+        effectiveProfile,
+        isAccountActive,
+        profileVerificationStatus,
+        profileVerificationError,
+        retryProfileVerification,
+        otherUserPendingCount,
         isAdmin,
         hasPerm,
         canAccess,
@@ -740,9 +741,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         printModalData,
         showPrintModal,
         closePrintModal,
-        operatorSwitchModalOpen,
-        openOperatorSwitchModal,
-        closeOperatorSwitchModal,
         egyptianCatalogModalOpen,
         openEgyptianCatalogModal,
         closeEgyptianCatalogModal,

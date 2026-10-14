@@ -6,7 +6,7 @@ import { EXPENSE_CATEGORIES } from '../lib/constants';
 import { Receipt, Plus, Trash2, Calendar, Search, AlertCircle, ShieldAlert } from 'lucide-react';
 
 export const ExpensesPage: React.FC = () => {
-  const { db, toast, isAdmin, hasPerm, currentProfile, activeOperator } = useApp();
+  const { db, toast, isAdmin, hasPerm, currentProfile } = useApp();
 
   const [filterMonth, setFilterMonth] = useState(todayStr().slice(0, 7));
   const [filterCat, setFilterCat] = useState('');
@@ -25,7 +25,7 @@ export const ExpensesPage: React.FC = () => {
   );
 
   // Determine if active user has Manager/Admin permission to perform backdate exception
-  const userRole = activeOperator?.role || currentProfile?.role || '';
+  const userRole = currentProfile?.role || '';
   const canOverride = isAdmin || userRole === 'admin' || userRole === 'manager' || hasPerm('editHistoricalSales');
 
   const expenses = (db.expenses || []).filter(e => {

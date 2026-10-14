@@ -10,11 +10,15 @@ import { QuickAddModal } from './components/QuickAddModal';
 import { PrintModal } from './components/PrintModal';
 import { FinancialShadowModal } from './components/FinancialShadowModal';
 import { InvoiceDetailModal } from './components/InvoiceDetailModal';
-import { OperatorSwitchModal } from './components/OperatorSwitchModal';
 import { OfflineSyncModal } from './components/OfflineSyncModal';
 import { EgyptianCatalogModal } from './pages/inventory/EgyptianCatalogModal';
-import { ShieldAlert, LogIn, Loader2, LogOut } from 'lucide-react';
+import { ShieldAlert, LogIn, Loader2, LogOut, AlertTriangle } from 'lucide-react';
 import { fsauth } from './lib/firebase';
+import {
+  MissingProfileScreen,
+  AccountDisabledScreen,
+  ProfileVerificationErrorScreen
+} from './components/AccessBlockedScreen';
 
 // Core Priority Page (Immediate Sync Import for fast initial render)
 import { SaleInvoicePage } from './pages/SaleInvoicePage';
@@ -57,14 +61,18 @@ const AppContent: React.FC = () => {
     openGlobalSearch,
     openScanModal,
     canAccess,
-    activeOperator,
-    openOperatorSwitchModal,
+    isAccountActive,
+    otherUserPendingCount,
+    openOfflineModal,
     egyptianCatalogModalOpen,
     closeEgyptianCatalogModal,
     toast,
     currentUser,
     currentProfile,
-    firstSyncDone
+    firstSyncDone,
+    profileVerificationStatus,
+    profileVerificationError,
+    retryProfileVerification
   } = useApp();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -103,7 +111,7 @@ const AppContent: React.FC = () => {
   }, [goTo, openGlobalSearch, openScanModal]);
 
   const renderActiveView = () => {
-    // Check if the current user or active operator has permission to view this page
+    // Check if the current user has permission to view this page
     if (!canAccess(currentPage)) {
       return (
         <div className="p-8 sm:p-12 rounded-3xl bg-white border-2 border-dashed border-rose-300 text-center max-w-xl mx-auto my-12 space-y-4 shadow-sm">
@@ -114,22 +122,22 @@ const AppContent: React.FC = () => {
             عفواً، هذه الشاشة غير مصرح بها لحسابك
           </h2>
           <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-            المشغل الحالي ({activeOperator ? activeOperator.name : 'الحساب الحالي'}) لا يمتلك الصلاحية الكافية للوصول إلى هذا القسم. يمكنك التبديل لحساب الإدارة أو إدخال رمز PIN المصرح به.
+            المستخدم الحالي ({currentProfile ? currentProfile.name : (currentUser?.displayName || currentUser?.email || 'الحساب الحالي')}) لا يمتلك الصلاحية الكافية للوصول إلى هذا القسم. يُرجى مراجعة إدارة النظام لتعديل صلاحياتك.
           </p>
 
           <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-            <button
-              onClick={openOperatorSwitchModal}
-              className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs sm:text-sm transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-xs"
-            >
-              <LogIn className="w-4 h-4" />
-              <span>تبديل الحساب / فتح برمز PIN</span>
-            </button>
             <button
               onClick={() => goTo('saleInvoice')}
               className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs sm:text-sm transition-colors cursor-pointer border border-slate-200"
             >
               الذهاب لشاشة المبيعات (POS)
+            </button>
+            <button
+              onClick={() => fsauth.signOut()}
+              className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-xs sm:text-sm transition-colors cursor-pointer border border-rose-200 flex items-center justify-center gap-1.5"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>تسجيل الخروج</span>
             </button>
           </div>
         </div>
@@ -191,36 +199,55 @@ const AppContent: React.FC = () => {
     return <CustomerDisplayScreen />;
   }
 
-  // Phase 2.6 - Stage A Requirement 2:
-  // When currentUser exists but no userProfiles document exists for this uid after initial loading,
-  // render an explicit, friendly blocking screen with a sign-out button instead of an empty or broken UI.
-  if (currentUser && !currentProfile && firstSyncDone) {
+  // 1. Loading verification state:
+  if (currentUser && profileVerificationStatus === 'loading') {
     return (
       <AuthGate>
         <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-xs flex items-center justify-center p-4" dir="rtl">
           <div className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl text-center space-y-4">
-            <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 text-amber-700 mx-auto flex items-center justify-center shadow-inner">
-              <ShieldAlert className="w-8 h-8" />
+            <div className="w-14 h-14 rounded-2xl bg-amber-50 border border-amber-200 text-amber-700 mx-auto flex items-center justify-center animate-pulse shadow-inner">
+              <Loader2 className="w-7 h-7 animate-spin" />
             </div>
             <h2 className="text-xl font-bold text-slate-900">
-              لا يوجد ملف صلاحيات لهذا الحساب
+              جاري فحص وتأكيد الصلاحيات...
             </h2>
             <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-              تم التحقق من بيانات الدخول، ولكن حسابك لم يُربط بعد بملف موظف أو صلاحيات في نظام المتجر. يُرجى التواصل مع المدير المسؤول لتعيين صلاحياتك.
+              جاري الاتصال بقاعدة البيانات لتأكيد هوية الجلسة والصلاحيات المعتمدة.
             </p>
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-right text-xs text-slate-500 font-mono space-y-1">
-              <div><span className="font-sans font-bold text-slate-700">المستخدم:</span> {currentUser.email || currentUser.displayName || 'بدون بريد'}</div>
-              <div><span className="font-sans font-bold text-slate-700">المعرّف (UID):</span> {currentUser.uid}</div>
-            </div>
-            <button
-              onClick={() => fsauth.signOut()}
-              className="w-full py-3 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-bold text-sm transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-xs"
-            >
-              <LogOut className="w-4 h-4" />
-              <span>تسجيل الخروج</span>
-            </button>
           </div>
         </div>
+      </AuthGate>
+    );
+  }
+
+  // 2. Read Failure / Verification Error State:
+  if (currentUser && profileVerificationStatus === 'error') {
+    return (
+      <AuthGate>
+        <ProfileVerificationErrorScreen
+          currentUser={currentUser}
+          errorMessage={profileVerificationError}
+          onRetry={retryProfileVerification}
+          onSignOut={() => fsauth.signOut()}
+        />
+      </AuthGate>
+    );
+  }
+
+  // 3. Confirmed Missing Profile (Read succeeded and explicitly confirmed profile does NOT exist):
+  if (currentUser && profileVerificationStatus === 'not_found') {
+    return (
+      <AuthGate>
+        <MissingProfileScreen currentUser={currentUser} />
+      </AuthGate>
+    );
+  }
+
+  // 4. Deactivated / Disabled Account:
+  if (currentUser && currentProfile && !isAccountActive) {
+    return (
+      <AuthGate>
+        <AccountDisabledScreen currentUser={currentUser} currentProfile={currentProfile} />
       </AuthGate>
     );
   }
@@ -235,6 +262,24 @@ const AppContent: React.FC = () => {
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           {/* Header Bar */}
           <Header onMenuToggle={() => setSidebarOpen(!sidebarOpen)} />
+
+          {/* Other User Pending Operations Warning Banner */}
+          {otherUserPendingCount > 0 && (
+            <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 text-xs text-amber-900 flex items-center justify-between gap-3 shadow-2xs no-print">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span className="truncate">
+                  <b>تنبيه أمان:</b> توجد <b>{otherUserPendingCount}</b> عملية أوفلاين معلقة على هذا الجهاز تخص موظفاً آخر. لن تُرفع تحت حسابك الحالي منعاً لتزييف الهوية، وستبقى محفوظة محلياً بأمان حتى يسجل صاحبها الدخول.
+                </span>
+              </div>
+              <button
+                onClick={openOfflineModal}
+                className="px-2.5 py-1 bg-amber-100 hover:bg-amber-200 text-amber-900 font-bold rounded-lg border border-amber-300 transition-colors shrink-0 cursor-pointer"
+              >
+                عرض العمليات
+              </button>
+            </div>
+          )}
 
           {/* Page Viewport with smooth scroll */}
           <main className="flex-1 overflow-y-auto p-3 sm:p-4 lg:p-6 bg-[#F1F5F9] space-y-4">
@@ -254,7 +299,6 @@ const AppContent: React.FC = () => {
         <PrintModal />
         <InvoiceDetailModal />
         <FinancialShadowModal />
-        <OperatorSwitchModal />
         <OfflineSyncModal />
         <EgyptianCatalogModal
           isOpen={egyptianCatalogModalOpen}

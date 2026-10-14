@@ -9,12 +9,9 @@ import {
   DEFAULT_ADMIN_PERMISSIONS,
   DEFAULT_CASHIER_PERMISSIONS,
   DEFAULT_MANAGER_PERMISSIONS,
-  DEFAULT_STOCKKEEPER_PERMISSIONS,
-  saveLocalUserProfiles,
-  getLocalUserProfiles
+  DEFAULT_STOCKKEEPER_PERMISSIONS
 } from '../lib/permissions';
 import { OfflineSyncManager } from '../lib/offlineSync';
-import { hashPin } from '../lib/pinSecurity';
 import {
   Users,
   ShieldCheck,
@@ -46,11 +43,8 @@ export const UsersPermissionsPage: React.FC = () => {
     setDb,
     currentUser,
     currentProfile,
-    activeOperator,
-    switchActiveOperator,
     isAdmin,
-    toast,
-    openOperatorSwitchModal
+    toast
   } = useApp();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -67,7 +61,6 @@ export const UsersPermissionsPage: React.FC = () => {
   const [formEmail, setFormEmail] = useState('');
   const [formPhone, setFormPhone] = useState('');
   const [formRole, setFormRole] = useState<UserRole>('cashier');
-  const [formPin, setFormPin] = useState('');
   const [formIsActive, setFormIsActive] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [formPermissions, setFormPermissions] = useState<UserPermissionSet>({
@@ -93,7 +86,6 @@ export const UsersPermissionsPage: React.FC = () => {
     setFormEmail('');
     setFormPhone('');
     setFormRole('cashier');
-    setFormPin('');
     setFormIsActive(true);
     setFormPermissions({ ...DEFAULT_CASHIER_PERMISSIONS });
     setIsModalOpen(true);
@@ -106,7 +98,6 @@ export const UsersPermissionsPage: React.FC = () => {
     setFormEmail(u.email || '');
     setFormPhone(u.phone || '');
     setFormRole(u.role || 'cashier');
-    setFormPin(''); // Keep blank for security; entering a new value will update the hash
     setFormIsActive(u.isActive !== false);
 
     const preset = ROLE_PRESETS[u.role]?.permissions || DEFAULT_CASHIER_PERMISSIONS;
@@ -168,26 +159,14 @@ export const UsersPermissionsPage: React.FC = () => {
       }
     }
 
-    if (editingUserId && formPin && !/^\d{4,6}$/.test(formPin.trim())) {
-      toast('رمز الـ PIN يجب أن يتكون من 4 إلى 6 أرقام');
-      return;
-    }
-
     setIsSaving(true);
     try {
       const targetUid = cleanUid;
       const existingUser = editingUserId ? usersList.find(x => x.uid === targetUid || x.id === targetUid) : null;
 
-      // Item D: Stop writing pinHash for new employees. Only retain/update for existing profiles if explicitly edited.
-      let resolvedPinHash: string | undefined = undefined;
-      if (editingUserId) {
-        resolvedPinHash = existingUser?.pinHash;
-        if (formPin.trim()) {
-          resolvedPinHash = await hashPin(formPin.trim());
-        } else if (!resolvedPinHash && existingUser?.pinCode) {
-          resolvedPinHash = await hashPin(existingUser.pinCode);
-        }
-      }
+      // Preserve existing PIN security hashes for existing profiles without modifying or writing new ones
+      const resolvedPinHash = editingUserId ? existingUser?.pinHash : undefined;
+      const resolvedPinSalt = editingUserId ? existingUser?.pinSalt : undefined;
 
       const newProfile: UserProfile = {
         id: targetUid,
@@ -197,6 +176,7 @@ export const UsersPermissionsPage: React.FC = () => {
         phone: formPhone.trim() || undefined,
         role: formRole,
         pinHash: resolvedPinHash,
+        pinSalt: resolvedPinSalt,
         isActive: formIsActive,
         permissions: formPermissions,
         createdBy: editingUserId ? existingUser?.createdBy : (currentUser?.uid || 'admin'),
@@ -206,7 +186,7 @@ export const UsersPermissionsPage: React.FC = () => {
           : new Date().toISOString()
       };
 
-      // 2. Immediately update state and persistent local storage
+      // 2. Immediately update in-memory state
       const existing = db.userProfiles || [];
       const index = existing.findIndex(x => x.uid === targetUid || x.id === targetUid);
       let updatedList: UserProfile[];
@@ -216,7 +196,6 @@ export const UsersPermissionsPage: React.FC = () => {
       } else {
         updatedList = [newProfile, ...existing];
       }
-      saveLocalUserProfiles(updatedList);
       setDb(prev => ({ ...prev, userProfiles: updatedList }));
 
       // 3. Save directly to cloud Firestore /userProfiles/{targetUid}
@@ -252,7 +231,6 @@ export const UsersPermissionsPage: React.FC = () => {
       const snap = await fsdb.collection('userProfiles').get();
       const cloudProfiles: UserProfile[] = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
 
-      saveLocalUserProfiles(cloudProfiles);
       setDb(prev => ({ ...prev, userProfiles: cloudProfiles }));
       toast(`✅ تمت مزامنة ${cloudProfiles.length} حساب موظف بنجاح من قاعدة البيانات السحابية!`);
     } catch (err: any) {
@@ -274,9 +252,8 @@ export const UsersPermissionsPage: React.FC = () => {
 
     const docId = u.id || u.uid;
 
-    // 1. Remove from local state & storage immediately
+    // 1. Remove from local state immediately
     const updatedList = (db.userProfiles || []).filter(x => x.uid !== docId && x.id !== docId);
-    saveLocalUserProfiles(updatedList);
     setDb(prev => ({ ...prev, userProfiles: updatedList }));
 
     // 2. Delete document from cloud Firestore
@@ -293,11 +270,10 @@ export const UsersPermissionsPage: React.FC = () => {
     const docId = u.id || u.uid;
     const nextActive = u.isActive === false ? true : false;
 
-    // 1. Update state & storage immediately
+    // 1. Update state immediately
     const updatedList = (db.userProfiles || []).map(x =>
       x.uid === docId || x.id === docId ? { ...x, isActive: nextActive } : x
     );
-    saveLocalUserProfiles(updatedList);
     setDb(prev => ({ ...prev, userProfiles: updatedList }));
 
     // 2. Sync to cloud Firestore
@@ -409,27 +385,20 @@ export const UsersPermissionsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Active Session Info Banner */}
+      {/* Authenticated Session Info Banner */}
       <div className="p-3.5 rounded-2xl bg-[#FEF3C7] border border-[#FDE68A] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-[#92400E]">
         <div className="flex items-center gap-2">
           <Sparkles className="w-4 h-4 text-amber-600 shrink-0" />
           <span>
-            <b>المشغل النشط حالياً على هذا الجهاز:</b>{' '}
+            <b>حساب الجلسة الحالي (Firebase Auth):</b>{' '}
             <span className="font-bold underline">
-              {activeOperator ? `${activeOperator.name} (${ROLE_PRESETS[activeOperator.role]?.label || activeOperator.role})` : 'المدير العام (Super Admin)'}
+              {currentProfile ? `${currentProfile.name} (${ROLE_PRESETS[currentProfile.role]?.label || currentProfile.role})` : (currentUser?.email || 'مستخدم مسجل')}
             </span>
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
-          {activeOperator && (
-            <button
-              onClick={() => switchActiveOperator(null)}
-              className="px-3 py-1 bg-white hover:bg-amber-50 text-amber-900 font-bold rounded-lg border border-amber-300 shadow-2xs transition-colors cursor-pointer"
-            >
-              👑 العودة لحساب الإدارة الرئيسي
-            </button>
-          )}
+        <div className="flex items-center gap-2 font-mono text-[11px] text-amber-800">
+          <span>UID: {currentUser?.uid}</span>
         </div>
       </div>
 
@@ -488,15 +457,15 @@ export const UsersPermissionsPage: React.FC = () => {
         {filteredUsers.map(u => {
           const preset = ROLE_PRESETS[u.role] || ROLE_PRESETS.cashier;
           const isActive = u.isActive !== false;
-          const isCurrentlyActive = activeOperator?.uid === u.uid || activeOperator?.id === u.id;
+          const isCurrentUser = currentUser?.uid === (u.uid || u.id);
           const uPerms = u.permissions || preset.permissions;
 
           return (
             <div
               key={u.id || u.uid}
               className={`p-5 rounded-3xl bg-[#FFFDF8] border transition-all flex flex-col justify-between ${
-                isCurrentlyActive
-                  ? 'border-amber-500 ring-2 ring-amber-400/30 shadow-md'
+                isCurrentUser
+                  ? 'border-emerald-500 ring-2 ring-emerald-400/30 shadow-md'
                   : isActive
                   ? 'border-[#D8CBB0] shadow-xs hover:border-[#A9762F]'
                   : 'border-slate-300 opacity-60 bg-slate-50'
@@ -512,9 +481,9 @@ export const UsersPermissionsPage: React.FC = () => {
                     <div>
                       <div className="flex items-center gap-1.5">
                         <h3 className="font-serif font-black text-sm text-[#1F2A3C]">{u.name}</h3>
-                        {isCurrentlyActive && (
-                          <span className="text-[10px] bg-amber-500 text-white font-black px-2 py-0.5 rounded-full">
-                            نشط الآن
+                        {isCurrentUser && (
+                          <span className="text-[10px] bg-emerald-600 text-white font-black px-2 py-0.5 rounded-full">
+                            حساب الجلسة الحالي
                           </span>
                         )}
                       </div>
@@ -537,13 +506,15 @@ export const UsersPermissionsPage: React.FC = () => {
                   </span>
                 </div>
 
-                {/* PIN Security Status Bar */}
+                {/* Security Status Bar */}
                 <div className="p-2.5 rounded-xl bg-[#F6F1E7] border border-[#EFE7D6] flex items-center justify-between text-xs mb-3">
                   <div className="flex items-center gap-1.5 text-[#475569]">
-                    <KeyRound className="w-3.5 h-3.5 text-[#A9762F]" />
-                    <span>حالة الـ PIN:</span>
-                    <span className="font-semibold text-[11px] text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-lg border border-emerald-200">
-                      {u.pinHash || u.pinCode ? '🔒 محمي بـ PIN مشفر (PBKDF2-HMAC-SHA256)' : '🔓 بدون رمز PIN'}
+                    <ShieldCheck className="w-3.5 h-3.5 text-[#A9762F]" />
+                    <span>حالة الحساب:</span>
+                    <span className={`font-semibold text-[11px] px-2 py-0.5 rounded-lg border ${
+                      isActive ? 'text-emerald-800 bg-emerald-50 border-emerald-200' : 'text-rose-800 bg-rose-50 border-rose-200'
+                    }`}>
+                      {isActive ? 'حساب نشط' : 'حساب معطّل'}
                     </span>
                   </div>
 
@@ -615,26 +586,16 @@ export const UsersPermissionsPage: React.FC = () => {
                   </button>
                 </div>
 
-                <button
-                  onClick={async () => {
-                    if (u.pinHash || u.pinCode) {
-                      openOperatorSwitchModal();
-                    } else {
-                      await switchActiveOperator(u.uid || u.id || '');
-                    }
-                  }}
-                  disabled={!isActive}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                    isCurrentlyActive
-                      ? 'bg-amber-600 text-white'
-                      : isActive
-                      ? 'bg-[#A9762F]/15 text-[#A9762F] hover:bg-[#A9762F] hover:text-white'
-                      : 'bg-slate-100 text-slate-400 cursor-not-allowed'
-                  }`}
-                >
-                  <LogIn className="w-3.5 h-3.5" />
-                  <span>{isCurrentlyActive ? 'أنت تعمل بهذا الحساب' : 'تبديل لهذا الحساب'}</span>
-                </button>
+                {isCurrentUser ? (
+                  <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>جلسة الدخول النشطة</span>
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-slate-400 font-medium font-mono">
+                    UID: {u.uid ? `${u.uid.slice(0, 10)}...` : 'غير مرتبط'}
+                  </span>
+                )}
               </div>
             </div>
           );
@@ -735,26 +696,6 @@ export const UsersPermissionsPage: React.FC = () => {
                     />
                     <span className="text-[10px] text-[#64748B] block mt-0.5">
                       معرف حساب Firebase Auth المرتبط بالملف
-                    </span>
-                  </div>
-                )}
-
-                {editingUserId && (
-                  <div>
-                    <label className="block text-xs font-bold text-[#3A4A63] mb-1">
-                      رمز الـ PIN (مشفر بـ PBKDF2-HMAC-SHA256)
-                    </label>
-                    <input
-                      type="password"
-                      maxLength={6}
-                      autoComplete="new-password"
-                      className="w-full px-3 py-2 text-sm font-mono font-bold text-center bg-[#F6F1E7] border border-[#D8CBB0] rounded-xl focus:outline-hidden focus:ring-2 focus:ring-[#A9762F]/40"
-                      placeholder="اتركه فارغاً للإبقاء على الـ PIN الحالي"
-                      value={formPin}
-                      onChange={e => setFormPin(e.target.value)}
-                    />
-                    <span className="text-[10px] text-[#64748B] block mt-0.5">
-                      مشفر تماماً — لن يتم حفظ الرمز كنص صريح أبداً (4-6 أرقام)
                     </span>
                   </div>
                 )}

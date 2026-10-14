@@ -29,8 +29,8 @@ export const Header: React.FC<{ onMenuToggle: () => void }> = ({ onMenuToggle })
     connStatus,
     openShadowTest,
     isAdmin,
-    activeOperator,
-    openOperatorSwitchModal,
+    currentUser,
+    currentProfile,
     openOfflineModal,
     pwaInstallPrompt,
     triggerPwaInstall,
@@ -39,8 +39,10 @@ export const Header: React.FC<{ onMenuToggle: () => void }> = ({ onMenuToggle })
   } = useApp();
 
   const handleLogout = async () => {
-    if (window.confirm('تسجيل الخروج من التطبيق؟')) {
+    try {
       await fsauth.signOut();
+    } catch (err: any) {
+      console.error('Logout error:', err);
     }
   };
 
@@ -68,7 +70,7 @@ export const Header: React.FC<{ onMenuToggle: () => void }> = ({ onMenuToggle })
     }
   };
 
-  const activeRolePreset = activeOperator ? ROLE_PRESETS[activeOperator.role] : ROLE_PRESETS.admin;
+  const currentRolePreset = currentProfile ? (ROLE_PRESETS[currentProfile.role] || ROLE_PRESETS.cashier) : ROLE_PRESETS.admin;
 
   return (
     <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between gap-3 shadow-xs no-print">
@@ -108,20 +110,19 @@ export const Header: React.FC<{ onMenuToggle: () => void }> = ({ onMenuToggle })
       </div>
 
       <div className="flex items-center gap-2">
-        {/* Active Operator Switch Button */}
-        <button
-          onClick={openOperatorSwitchModal}
-          className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl bg-[#FFFDF8] hover:bg-[#FAF6EE] text-slate-800 text-xs font-bold border border-[#D8CBB0] shadow-2xs transition-all cursor-pointer"
-          title="انقر لتبديل الموظف أو قفل الشاشة برمز PIN"
+        {/* Authenticated Firebase User Info */}
+        <div
+          className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl bg-[#FFFDF8] text-slate-800 text-xs font-bold border border-[#D8CBB0] shadow-2xs select-none"
+          title={`المستخدم المسجل في الجلسة: ${currentProfile?.name || currentUser?.displayName || currentUser?.email || 'المستخدم'}`}
         >
-          <span className="text-sm">{activeRolePreset?.icon || '👤'}</span>
+          <span className="text-sm">{currentRolePreset?.icon || '👤'}</span>
           <span className="max-w-[90px] sm:max-w-[140px] truncate font-bold text-[#1F2A3C]">
-            {activeOperator ? activeOperator.name : 'المدير العام'}
+            {currentProfile ? currentProfile.name : (currentUser?.displayName || currentUser?.email || 'المدير العام')}
           </span>
           <span className="hidden sm:inline-block text-[10px] text-amber-700 bg-amber-100 px-1.5 py-0.2 rounded font-bold">
-            {activeRolePreset?.label.split(' ')[0]}
+            {currentRolePreset?.label.split(' ')[0]}
           </span>
-        </button>
+        </div>
 
         {/* Egyptian Stationery Catalog Button */}
         <button

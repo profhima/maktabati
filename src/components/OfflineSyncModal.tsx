@@ -38,6 +38,7 @@ export const OfflineSyncModal: React.FC<OfflineSyncModalProps> = ({
     toast,
     db,
     showPrintModal,
+    currentUser,
     currentProfile,
     offlineModalOpen,
     closeOfflineModal,
@@ -50,7 +51,7 @@ export const OfflineSyncModal: React.FC<OfflineSyncModalProps> = ({
   const pwaPrompt = propPwaInstallPrompt || appPwaPrompt;
   const onInstall = propOnTriggerInstall || appTriggerInstall;
 
-  const [queue, setQueue] = useState<QueuedOfflineOperation[]>([]);
+  const [queue, setQueue] = useState<QueuedOfflineOperation[]>(() => OfflineSyncManager.getQueue());
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncLogs, setSyncLogs] = useState<string[]>([]);
   const [storageInfo, setStorageInfo] = useState<{ usageMB: number; quotaMB: number; percent: number }>({
@@ -304,6 +305,23 @@ export const OfflineSyncModal: React.FC<OfflineSyncModalProps> = ({
               )}
             </div>
 
+            {/* Other User Operations Warning Alert */}
+            {(() => {
+              const otherUserOps = queue.filter(q => q.status !== 'synced' && (!q.ownerUid || q.ownerUid !== currentUser?.uid));
+              if (otherUserOps.length === 0) return null;
+              return (
+                <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 space-y-1">
+                  <div className="font-bold flex items-center gap-1.5 text-amber-800">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>تنبيه أمان: عمليات معلقة لحساب آخر ({otherUserOps.length})</span>
+                  </div>
+                  <p className="text-[11px] text-amber-700 leading-relaxed">
+                    توجد عمليات في الطابور مسجلة بحساب موظف آخر أو بدون معرّف مالك. لن تُرفع تحت حسابك الحالي منعاً لتزييف الهوية، وستظل محفوظة في هذا الجهاز حتى يسجل صاحبها الدخول.
+                  </p>
+                </div>
+              );
+            })()}
+
             {queue.length === 0 ? (
               <div className="p-6 bg-slate-50 border border-dashed border-slate-200 rounded-xl text-center">
                 <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto mb-2 opacity-80" />
@@ -336,6 +354,16 @@ export const OfflineSyncModal: React.FC<OfflineSyncModalProps> = ({
                         <div className="text-[10px] text-slate-400 font-mono mt-0.5">
                           {formatTimeEn(op.createdAt)} — {op.type}
                         </div>
+                        {op.ownerUid && op.ownerUid !== currentUser?.uid && (
+                          <div className="text-[10px] text-amber-700 mt-0.5 font-bold">
+                            ⚠️ حساب آخر ({op.ownerUid}) — لن تُرفع إلا بحسابه
+                          </div>
+                        )}
+                        {!op.ownerUid && (
+                          <div className="text-[10px] text-slate-500 mt-0.5 font-bold">
+                            ⚠️ بدون معرّف مالك — لن تُرفع تلقائياً
+                          </div>
+                        )}
                         {op.errorMsg && (
                           <div className="text-[10px] text-red-600 mt-0.5 font-medium">{op.errorMsg}</div>
                         )}
